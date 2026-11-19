@@ -417,6 +417,7 @@ function closeDrawer() {
 function openFromHash() {
   const id = location.hash.slice(1);
   if (/^T\d+$/.test(id) && id !== ui.open) openTask(id);
+  if (/^C[0-9a-f-]{36}$/.test(id)) conversationReader(id.slice(1));
 }
 window.addEventListener('hashchange', openFromHash);
 
@@ -601,36 +602,111 @@ function showDialog(title, body, foot) {
 const closeDialog = () => $('#dlg').close();
 const cancelBtn = () => h('button', { class: 'btn ghost', onclick: closeDialog }, 'Cancel');
 
+const MODES_SHORT = [['plan', 'Plan only'], ['edit', 'Edit files']];
+const MODELS_SHORT = [['', 'Default'], ['haiku', 'Haiku'], ['sonnet', 'Sonnet'], ['opus', 'Opus'], ['fable', 'Fable']];
+const HEAVY = ['Android', 'Gradle', 'Flutter'];
+
+// A compact list of a project's saved Claude conversations, shown beside the
+// add-task forms so you can see where each project stands while you write.
+function convoPanel(opts = {}) {
+  const list = h('div', { class: 'cp-list' });
+  const picker = opts.picker ? select(S.projects.map((p) => [p.id, p.name]), '', (v) => panel.show(v, true)) : null;
+  const el = h('aside', { class: 'cp' }, h('div', { class: 'cp-head' }, h('span', { class: 'sect-title' }, 'Recent conversations'), picker), list);
+  const panel = { el, pid: null, pinned: false, linked: new Set(), show };
+  let ticket = 0;
+  async function show(pid, byHand) {
+    if (byHand) panel.pinned = true;
+    if (!pid || pid === panel.pid) return;
+    panel.pid = pid;
+    panel.linked.clear();
+    if (picker) picker.value = pid;
+    const mine = ++ticket;
+    list.replaceChildren(h('p', { class: 'hint' }, 'Reading…'));
+    let r;
+    try { r = await api('GET', `/api/projects/${pid}/conversations`, null, { quiet: true }); } catch { r = { conversations: [] }; }
+    if (mine !== ticket) return;
+    if (!r.conversations.length) { list.replaceChildren(h('p', { class: 'hint' }, 'No saved conversations for this project.')); return; }
+    list.replaceChildren(...r.conversations.slice(0, 12).map((c) => {
+      const peek = h('div', { class: 'cp-peek' });
+      return h('details', { class: 'cp-item', ontoggle: (e) => {
+        if (!e.target.open || peek.childNodes.length) return;
+        peek.append(
+          c.lastPrompt && h('div', null, h('span', { class: 'cp-tag' }, 'You last asked'), h('p', null, c.lastPrompt)),
+          c.lastReply && h('div', null, h('span', { class: 'cp-tag' }, 'Claude ended with'), h('div', { class: 'cp-reply' }, md(c.lastReply))),
+          h('div', { class: 'cp-actions' },
+            h('a', { class: 'link', href: `/#C${c.id}`, target: '_blank', rel: 'noopener' }, 'Open full conversation'),
+            opts.linkable && h('label', { class: 'cp-link' }, h('input', { type: 'checkbox', onchange: (ev) => { if (ev.target.checked) panel.linked.add(c.id); else panel.linked.delete(c.id); } }), 'Link to this task')));
+      } },
+      h('summary', null, h('span', { class: 'cp-title' }, c.title), h('span', { class: 'cp-when' }, [ago(c.updatedAt), c.agentTask ? `agent ${c.agentTask}` : null].filter(Boolean).join(' · '))),
+      peek);
+    }));
+  }
+  return panel;
+}
+
+// How many agents may run at once, with plain advice about this Mac. The user
+// decides; the advice only says what to expect.
+function agentLimit(onchange) {
+  const sys = S.meta.system || { memGb: 8, cores: 4 };
+  const active = S.projects.filter((p) => p.status === 'active');
+  const weights = active.map((p) => (HEAVY.includes(p.info && p.info.type) ? 3 : 1)).sort((a, b) => b - a);
+  const reserve = 6; // macOS, VS Code, browser, an emulator
+  const heavyMax = Math.max(1, Math.floor((sys.memGb - reserve) / 3));
+  const lightMax = Math.max(1, Math.min(sys.cores, sys.memGb - reserve));
+  const top = Math.max(4, Math.min(16, S.projects.length));
+  const pick = select(Array.from({ length: top }, (_, k) => [String(k + 1), String(k + 1)]), String(Math.min(top, S.settings.maxAgents)), () => { verdict(); if (onchange) onchange(Number(pick.value)); });
+  const note = h('p', { class: 'hint' });
+  function verdict() {
+    const n = Number(pick.value);
+    let need = reserve;
+    for (let k = 0; k < n; k++) need += weights[k] || 0.5;
+    const heavyN = weights.slice(0, n).filter((w) => w === 3).length;
+    const base = `This Mac has ${sys.memGb} GB of memory and ${sys.cores} cores. An agent building an Android app needs about 3 GB; a web or plan-only agent about 1 GB or less. Comfortable here: up to ${heavyMax} with Android builds, up to ${lightMax} for light work.`;
+    const worst = `${n} at once on your heaviest projects${heavyN ? ` (${heavyN} Android)` : ''} could need about ${Math.round(need)} GB with your other apps.`;
+    note.className = `hint${need > sys.memGb ? ' warn-text' : ''}`;
+    note.textContent = `${base} ${worst} ${need > sys.memGb ? 'That is more than this Mac has, so expect slow or failed builds. It is your call.' : 'That should fit.'}`;
+  }
+  verdict();
+  return { pick, note, get value() { return Number(pick.value); } };
+}
+
 function newTaskDialog() {
   if (!S.projects.length) return linkDialog();
   const active = S.projects.filter((p) => p.status === 'active');
   const projects = active.length ? active : S.projects;
   const start = projects.some((p) => p.id === ui.filter) ? ui.filter : projects[0].id;
-  const project = select(S.projects.map((p) => [p.id, p.name]), start, () => {});
+  const panel = convoPanel({ linkable: true });
+  const project = select(S.projects.map((p) => [p.id, p.name]), start, (v) => panel.show(v));
   const title = h('input', { type: 'text', placeholder: 'Short name for the task' });
-  const desc = h('textarea', { rows: 7, placeholder: 'Describe the task the way you would brief a developer: what to change, where, and how to tell it worked.' });
-  const mode = select(MODES, 'plan', () => {});
-  const model = select(MODELS, '', () => {});
+  const desc = h('textarea', { rows: 5, placeholder: 'What to change, where, and how to tell it worked.' });
+  const mode = select(MODES_SHORT, 'plan', () => {});
+  const model = select(MODELS_SHORT, '', () => {});
   const priority = select(PRIORITIES, 'normal', () => {});
   const budget = budgetInput(0, () => {});
   const create = async (run) => {
     if (!title.value.trim()) { title.focus(); return toast('Give the task a title.'); }
-    await api('POST', '/api/tasks', { projectId: project.value, title: title.value, description: desc.value, mode: mode.value, model: model.value, priority: priority.value, budget: Number(budget.value) || 0, run });
+    const t = await api('POST', '/api/tasks', { projectId: project.value, title: title.value, description: desc.value, mode: mode.value, model: model.value, priority: priority.value, budget: Number(budget.value) || 0, run });
+    for (const sessionId of panel.linked) await api('POST', `/api/tasks/${t.id}/link`, { sessionId }).catch(() => {});
     closeDialog();
     refreshSoon();
   };
   showDialog('New task', [
-    h('button', { class: 'link', onclick: () => bulkDialog() }, 'Add several tasks at once, across projects →'),
-    field('Project', project),
-    field('Title', title),
-    field('What should be done', desc),
-    h('div', { class: 'row' }, field('Agent may', mode), field('Model', model), field('Priority', priority), field('Spend limit for one run ($)', budget)),
-    h('p', { class: 'hint' }, 'Plan only: the agent reads the code and writes a plan, and changes nothing. Edit files: it does the work but never commits or pushes. Cheaper models suit small, clearly described tasks.'),
+    h('div', { class: 'split' },
+      h('div', { class: 'stack tight' },
+        h('div', { class: 'row two' }, field('Project', project), field('Title', title)),
+        field('What should be done', desc),
+        h('div', { class: 'row four' }, field('Agent may', mode), field('Model', model), field('Priority', priority), field('Limit ($)', budget)),
+        h('p', { class: 'hint' }, 'Plan only changes nothing. Edit files does the work but never commits.')),
+      panel.el),
   ], [
+    h('button', { class: 'link', onclick: () => bulkDialog() }, 'Several tasks →'),
+    h('span', { class: 'spacer' }),
     cancelBtn(),
     h('button', { class: 'btn', onclick: () => create(false) }, 'Add to board'),
     h('button', { class: 'btn primary', onclick: () => create(true) }, 'Add and run agent'),
   ]);
+  $('#dlg').style.width = 'min(920px, calc(100vw - 32px))';
+  panel.show(start);
   title.focus();
 }
 
@@ -677,14 +753,25 @@ function bulkDialog() {
   const order = { active: 0, paused: 1, shipped: 2 };
   const projects = [...S.projects].sort((x, y) => order[x.status] - order[y.status] || x.name.localeCompare(y.name));
   const eg = projects.map((p) => p.name);
-  const box = h('textarea', { rows: 8, spellcheck: true, 'aria-label': 'Tasks, one per line',
+  const panel = convoPanel({ picker: true });
+  const limit = agentLimit((n) => api('PATCH', '/api/settings', { maxAgents: n }).then(() => { S.settings.maxAgents = n; }));
+  const box = h('textarea', { rows: 6, spellcheck: true, 'aria-label': 'Tasks, one per line',
     placeholder: `@${eg[0]} Fix the crash on the settings screen\n    Details go on indented lines under the task.\n@${eg[0]}${eg[1] ? ` @${eg[1]}` : ''} Update the dependencies` });
-  const fallback = select([['', 'Nothing: every line needs a tag'], ...projects.map((p) => [p.id, p.name])],
+  const fallback = select([['', 'Nothing (tag needed)'], ...projects.map((p) => [p.id, p.name])],
     S.projects.some((p) => p.id === ui.filter) ? ui.filter : '', () => update());
-  const mode = select(MODES, 'plan', () => {});
-  const model = select(MODELS, '', () => {});
+  const mode = select(MODES_SHORT, 'plan', () => {});
+  const model = select(MODELS_SHORT, '', () => {});
   const priority = select(PRIORITIES, 'normal', () => {});
   const preview = h('div', { class: 'bulk-preview' });
+  // The side list follows the project tagged on the line you are typing.
+  const follow = () => {
+    if (panel.pinned) return;
+    const upto = box.value.slice(0, box.selectionStart);
+    const line = box.value.split('\n')[upto.split('\n').length - 1] || '';
+    const hit = parseBulk(line, fallback.value)[0];
+    const pid = (hit && hit.projectIds[hit.projectIds.length - 1]) || (parsed[0] && parsed[0].projectIds[0]) || fallback.value;
+    if (pid) panel.show(pid);
+  };
   const addBtn = h('button', { class: 'btn', onclick: () => create(false) });
   const runBtn = h('button', { class: 'btn primary', onclick: () => create(true) });
   let parsed = [];
@@ -708,7 +795,9 @@ function bulkDialog() {
     runBtn.textContent = total && !bad ? `Add and run ${plural(total, 'agent')}` : 'Add and run agents';
     addBtn.disabled = runBtn.disabled = bad || !total;
   }
-  box.addEventListener('input', update);
+  box.addEventListener('input', () => { panel.pinned = false; update(); follow(); });
+  box.addEventListener('keyup', follow);
+  box.addEventListener('click', follow);
 
   const insertTag = (name) => {
     const at = box.selectionStart;
@@ -716,7 +805,9 @@ function bulkDialog() {
     const tag = `${before && !/\s$/.test(before) ? ' ' : ''}@${name} `;
     box.setRangeText(tag, at, box.selectionEnd, 'end');
     box.focus();
+    panel.pinned = false;
     update();
+    follow();
   };
 
   async function create(run) {
@@ -738,21 +829,24 @@ function bulkDialog() {
   }
 
   showDialog('Add several tasks', [
-    h('p', { class: 'hint' }, 'One task per line. Tag the project with @Name. Tag more than one project to give the same task to each. Indent a line to add details to the task above it.'),
-    h('div', { class: 'tagbar' }, h('span', { class: 'hint' }, 'Insert tag:'),
-      projects.map((p) => h('button', { class: 'chip tag', title: p.path, onclick: () => insertTag(p.name) }, `@${p.name}`))),
-    box,
-    preview,
-    field('Lines without a tag go to', fallback),
-    h('div', { class: 'row' }, field('Agent may', mode), field('Model', model), field('Priority', priority)),
-    h('p', { class: 'hint' }, `These three settings apply to every task here; you can change each task afterwards. Up to ${S.settings.maxAgents} agents run at once and the rest wait in the queue.`),
+    h('div', { class: 'split' },
+      h('div', { class: 'stack tight' },
+        h('div', { class: 'tagbar' }, projects.map((p) => h('button', { class: 'chip tag', title: p.path, onclick: () => insertTag(p.name) }, `@${p.name}`))),
+        box,
+        h('p', { class: 'hint' }, 'One task per line. Tag with @Name (several tags give the task to each project). Indent a line for details.'),
+        preview,
+        h('div', { class: 'row four' }, field('Untagged lines go to', fallback), field('Agent may', mode), field('Model', model), field('Priority', priority)),
+        h('div', { class: 'row agents' }, field('Agents at once', limit.pick), limit.note)),
+      panel.el),
   ], [
     h('button', { class: 'link', onclick: () => newTaskDialog() }, '← One task'),
     h('span', { class: 'spacer' }),
     cancelBtn(), addBtn, runBtn,
   ]);
-  $('#dlg').style.width = 'min(680px, calc(100vw - 32px))';
+  $('#dlg').style.width = 'min(980px, calc(100vw - 32px))';
   update();
+  follow();
+  if (!panel.pid) panel.show(projects[0].id);
   box.focus();
 }
 
@@ -870,12 +964,14 @@ function projectDialog(pid) {
 }
 
 function settingsDialog() {
-  const max = select([[1, '1'], [2, '2'], [3, '3'], [4, '4']].map(([v, l]) => [String(v), l]), String(S.settings.maxAgents), () => {});
+  const limit = agentLimit();
+  const max = limit.pick;
   const model = select(MODELS, S.settings.defaultModel || '', () => {});
   const bin = h('input', { type: 'text', value: S.settings.claudePath || '', placeholder: S.meta.claude || 'Not found: paste the full path', spellcheck: false });
   showDialog('Settings', [
     field('Agents running at the same time', max),
-    h('p', { class: 'hint' }, 'Extra tasks wait in the queue. Two agents never edit the same project at once. Each Gradle build needs 2 to 3 GB of memory, so 2 is a safe number on this Mac.'),
+    limit.note,
+    h('p', { class: 'hint' }, 'Extra tasks wait in the queue. Two agents never edit the same project at once, so there is no gain in going above your number of projects.'),
     field('Model for tasks set to "Default"', model),
     field('Path to the claude program (leave empty to find it automatically)', bin),
     h('p', { class: 'hint' }, S.meta.claude ? `Using now: ${S.meta.claude}` : 'The claude program was not found.'),

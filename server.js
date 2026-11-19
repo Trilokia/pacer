@@ -359,7 +359,7 @@ function parseSession(file) {
   const key = `${stat.mtimeMs}:${stat.size}`;
   const hit = sessionCache.get(file);
   if (hit && hit.key === key) return hit.data;
-  const data = { id: path.basename(file, '.jsonl'), title: '', first: '', prompts: 0, cost: 0, startedAt: 0, updatedAt: stat.mtimeMs, cwd: '', items: [], tooBig: stat.size > 150e6 };
+  const data = { id: path.basename(file, '.jsonl'), title: '', first: '', lastPrompt: '', lastReply: '', prompts: 0, cost: 0, startedAt: 0, updatedAt: stat.mtimeMs, cwd: '', items: [], tooBig: stat.size > 150e6 };
   if (!data.tooBig) {
     for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
       if (!line || line.startsWith('{"type":"api-request') || line.startsWith('{"type":"file-history')) continue;
@@ -381,8 +381,10 @@ function parseSession(file) {
           if (e.isCompactSummary) { data.items.push({ role: 'note', t, text: 'Claude summarised the earlier part of this conversation here.' }); continue; }
           data.prompts += 1;
           if (!data.first) data.first = s.split('\n')[0].slice(0, 120);
+          data.lastPrompt = s.slice(0, 500);
           data.items.push({ role: 'user', t, text: s.slice(0, 8000) });
         } else if (b.type === 'text' && b.text && b.text.trim()) {
+          data.lastReply = b.text.trim().slice(0, 900);
           data.items.push({ role: 'assistant', t, text: b.text.trim().slice(0, 8000) });
         } else if (b.type === 'tool_use') {
           data.items.push({ role: 'tool', t, text: toolLine(b.name, b.input, e.cwd || data.cwd || '/') });
@@ -733,7 +735,8 @@ const api = {
       projects,
       tasks: db.tasks.map(briefTask),
       usage: usage(),
-      meta: { claude: findClaude(), running: running.size, suggestRoot: path.dirname(__dirname), home: os.homedir() },
+      meta: { claude: findClaude(), running: running.size, suggestRoot: path.dirname(__dirname), home: os.homedir(),
+        system: { memGb: Math.round(os.totalmem() / 2 ** 30), cores: os.cpus().length } },
     };
   },
 
@@ -1024,7 +1027,7 @@ const api = {
   },
 
   patchSettings(req, res, m, body) {
-    if ('maxAgents' in body) db.settings.maxAgents = Math.min(4, Math.max(1, Math.round(Number(body.maxAgents)) || 1));
+    if ('maxAgents' in body) db.settings.maxAgents = Math.min(16, Math.max(1, Math.round(Number(body.maxAgents)) || 1));
     if ('defaultModel' in body) db.settings.defaultModel = pick(body.defaultModel, MODELS, 'model');
     if ('claudePath' in body) db.settings.claudePath = text(body.claudePath, 500).trim();
     const money = (v) => Math.min(100000, Math.max(0, Math.round((Number(v) || 0) * 100) / 100));

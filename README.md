@@ -60,6 +60,8 @@ Claude Code saves every conversation on this Mac, per folder. The dashboard read
 - A task's **Conversations** section shows the dashboard agent's own conversation and any you linked with **Link a conversation**.
 - A VS Code session that claims, notes or finishes a task through `dash.js` links its own conversation to that task automatically.
 
+Both add-task dialogs show the chosen project's recent conversations on the right, so you can see where it stands while you write. Open one to see what you last asked and how Claude ended.
+
 Claude removes saved conversations after about 30 days, and chats on claude.ai are not stored on the Mac, so neither can be shown.
 
 ### Reviewing what changed
@@ -78,7 +80,7 @@ Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts 
 
 ### Limits that keep things safe
 
-- At most 2 agents run at once (change this in Settings, up to 4). Extra tasks wait in the queue.
+- At most 2 agents run at once by default. You choose the number in Settings or in the "several tasks" dialog, up to one per project (16 at most). The dashboard tells you what this Mac's memory can comfortably take, but the choice is yours. Extra tasks wait in the queue.
 - Two agents never edit the same project at the same time.
 - Agents cannot commit or push. A check runs before each of their shell commands (`guard/pre-tool.js`), and git itself refuses through hooks in `guard/githooks/` that apply only to agent runs. Your own git commands are not affected.
 - Editing agents run in Claude Code's `auto` permission mode, which blocks risky actions on its own.

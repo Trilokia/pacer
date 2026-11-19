@@ -1,0 +1,5 @@
+#!/bin/sh
+# Used only while a dashboard agent is running (set through GIT_CONFIG_* in its
+# environment). Your own git commands never see this folder.
+echo "Refused: dashboard agents must not commit or push. Leave the changes for the user to review." >&2
+exit 1

@@ -12,6 +12,9 @@
  *   node dash.js done T12 "..."  finish with a short report (moves to Needs review)
  *   node dash.js fail T12 "..."  give up with a reason (moves to Needs review)
  *   node dash.js add "Title" [-d "details"] [--mode plan|edit] [--project Name]
+ *   node dash.js link T12        attach this Claude conversation to the task
+ *
+ * claim, note, done and fail also attach the conversation automatically.
  *
  * Options: --as "Name" sets who you are (default "VS Code session" or $DASH_NAME).
  */
@@ -66,6 +69,7 @@ function projectForCwd(projects) {
 }
 
 const who = (opt) => opt.as || process.env.DASH_NAME || 'VS Code session';
+const sessionId = process.env.CLAUDE_CODE_SESSION_ID || undefined; // set inside a Claude Code session
 const when = (ts) => new Date(ts).toLocaleString('en-IN', { hour12: false });
 
 async function main() {
@@ -122,7 +126,7 @@ async function main() {
   }
 
   if (cmd === 'claim') {
-    const t = await call('POST', `/api/tasks/${taskId(pos[0])}/claim`, { name: who(opt) });
+    const t = await call('POST', `/api/tasks/${taskId(pos[0])}/claim`, { name: who(opt), sessionId });
     console.log(`${t.id} is now yours: ${t.title}`);
     console.log(`Mode: ${t.mode === 'edit' ? 'edit files' : 'PLAN ONLY, do not change files'}`);
     console.log(`Read it with: show ${t.id}. Post progress with: note ${t.id} "...". Finish with: done ${t.id} "short report".`);
@@ -133,8 +137,15 @@ async function main() {
     const id = taskId(pos[0]);
     const body = pos.slice(1).join(' ').trim();
     if (!body) fail(`Add the text, for example: ${cmd} ${id} "what happened"`);
-    const t = await call('POST', `/api/tasks/${id}/${cmd}`, { text: body, name: who(opt) });
+    const t = await call('POST', `/api/tasks/${id}/${cmd}`, { text: body, name: who(opt), sessionId });
     console.log({ note: `Note added to ${t.id}.`, done: `${t.id} moved to Needs review.`, fail: `${t.id} moved to Needs review as not finished.` }[cmd]);
+    return;
+  }
+
+  if (cmd === 'link') {
+    if (!sessionId) fail('This only works inside a Claude Code session.');
+    const t = await call('POST', `/api/tasks/${taskId(pos[0])}/link`, { sessionId });
+    console.log(`This conversation is now linked to ${t.id}.`);
     return;
   }
 

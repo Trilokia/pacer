@@ -297,7 +297,7 @@ function renderBoard() {
     const bits = [project.path];
     if (project.deadline) bits.push(`Deadline ${new Date(project.deadline + 'T00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`);
     if (project.info && project.info.git && project.info.git.last) bits.push(`Last commit: ${project.info.git.last.subject}`);
-    sub.textContent = bits.join(' · ');
+    sub.append(bits.join(' · '), ' · ', h('button', { class: 'link', onclick: () => conversationsDialog(project.id) }, 'Conversations'));
   }
 
   if (!S.projects.length) {
@@ -397,7 +397,7 @@ async function openTask(id) {
   ui.open = id;
   ui.task = null;
   if (location.hash !== `#${id}`) history.replaceState(null, '', `#${id}`);
-  for (const sel of ['#d-head', '#d-fields', '#d-actions', '#d-follow', '#d-report', '#d-changes', '#d-log', '#d-foot']) {
+  for (const sel of ['#d-head', '#d-fields', '#d-actions', '#d-follow', '#d-report', '#d-changes', '#d-convos', '#d-log', '#d-foot']) {
     const el = $(sel);
     el.replaceChildren();
     delete el.dataset.key;
@@ -549,6 +549,17 @@ function renderDrawer() {
       c.files ? h('p', { class: 'hint' }, `Compared with the project as it was when the task started. Recorded ${ago(c.at)}; nothing is committed.`) : null,
     ];
   });
+
+  const convos = t.conversationInfo || [];
+  part('#d-convos', JSON.stringify(convos.map((c) => [c.id, c.title, c.updatedAt, c.missing])), () => [
+    h('div', { class: 'sect-title' }, 'Conversations'),
+    convos.length ? h('ul', { class: 'found' }, convos.map((c) => h('li', { class: 'convo-row' },
+      h('button', { class: 'convo-open', disabled: c.missing, onclick: () => conversationReader(c.id) },
+        h('span', { class: 'n' }, c.title),
+        h('span', { class: 'hint' }, [c.kind === 'agent' ? 'Dashboard agent' : 'Linked', c.missing ? null : ago(c.updatedAt), c.prompts ? plural(c.prompts, 'message') + ' from you' : null].filter(Boolean).join(' · '))),
+      c.kind === 'linked' && h('button', { class: 'link', onclick: () => act(id, 'unlink', { sessionId: c.id }) }, 'Unlink')))) : null,
+    h('button', { class: 'btn small', onclick: () => conversationsDialog(t.projectId, id) }, 'Link a conversation'),
+  ]);
 
   const logEl = $('#d-log .log');
   const stick = !logEl || logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
@@ -836,6 +847,7 @@ function projectDialog(pid) {
   showDialog(p.name, [
     h('dl', { class: 'kv' }, facts.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
     h('div', { style: 'display:flex; gap:8px; flex-wrap:wrap' },
+      h('button', { class: 'btn small', onclick: () => conversationsDialog(p.id) }, 'Conversations'),
       h('button', { class: 'btn small', onclick: () => api('POST', `/api/projects/${p.id}/open`, { app: 'finder' }) }, 'Open in Finder'),
       h('button', { class: 'btn small', onclick: () => api('POST', `/api/projects/${p.id}/open`, { app: 'vscode' }) }, 'Open in VS Code')),
     field('Name', name),
@@ -875,6 +887,67 @@ function settingsDialog() {
       refresh();
     } }, 'Save'),
   ]);
+}
+
+// ---------------------------------------------------------------- saved conversations
+
+// Lists the Claude conversations saved for a project. With linkTo (a task id)
+// each row also gets a Link button.
+async function conversationsDialog(pid, linkTo) {
+  const p = S.projects.find((x) => x.id === pid);
+  if (!p) return;
+  const body = h('div', null, h('p', { class: 'hint' }, 'Reading saved conversations…'));
+  showDialog(linkTo ? `Link a conversation to ${linkTo}` : `Conversations in ${p.name}`, [
+    body,
+    h('p', { class: 'hint' }, 'These are the Claude Code conversations saved on this Mac for this folder. Claude removes them after about 30 days. Chats on claude.ai are not stored here.'),
+  ], [h('button', { class: 'btn ghost', onclick: closeDialog }, 'Close')]);
+  $('#dlg').style.width = 'min(680px, calc(100vw - 32px))';
+  let r;
+  try { r = await api('GET', `/api/projects/${pid}/conversations`); } catch { body.replaceChildren(h('p', { class: 'hint' }, 'Could not read the conversations.')); return; }
+  if (!r.conversations.length) { body.replaceChildren(h('p', { class: 'hint' }, 'No saved conversations for this folder.')); return; }
+  body.replaceChildren(h('ul', { class: 'found' }, r.conversations.map((c) => h('li', { class: 'convo-row' },
+    h('button', { class: 'convo-open', disabled: c.tooBig, onclick: () => conversationReader(c.id, () => conversationsDialog(pid, linkTo)) },
+      h('span', { class: 'n' }, c.title),
+      h('span', { class: 'hint' }, [ago(c.updatedAt), c.tooBig ? 'too large to show' : plural(c.prompts, 'message') + ' from you', c.cost ? money(c.cost) : null].filter(Boolean).join(' · '))),
+    c.agentTask && h('span', { class: 'chip' }, `Agent ${c.agentTask}`),
+    c.tasks.filter((x) => x !== c.agentTask).map((x) => h('span', { class: 'chip edit' }, x)),
+    linkTo && !c.tasks.includes(linkTo) && h('button', { class: 'btn small', onclick: async () => {
+      await api('POST', `/api/tasks/${linkTo}/link`, { sessionId: c.id });
+      closeDialog();
+      refreshSoon();
+    } }, 'Link')))));
+}
+
+async function conversationReader(sessionId, back) {
+  const body = h('div', { class: 'convo' }, h('p', { class: 'hint' }, 'Opening…'));
+  const foot = [back && h('button', { class: 'link', onclick: back }, '← All conversations'), h('span', { class: 'spacer' }), h('button', { class: 'btn ghost', onclick: closeDialog }, 'Close')];
+  showDialog('Conversation', [body], foot);
+  $('#dlg').style.width = 'min(820px, calc(100vw - 32px))';
+  let c;
+  try { c = await api('GET', `/api/conversations/${sessionId}`); } catch { body.replaceChildren(h('p', { class: 'hint' }, 'This conversation is no longer saved on this Mac.')); return; }
+  $('#dlg .dlg-head').textContent = c.title;
+  const nodes = [h('p', { class: 'hint' }, [
+    c.startedAt ? `Started ${new Date(c.startedAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false })}` : null,
+    `last active ${ago(c.updatedAt)}`, c.cost ? money(c.cost) : null,
+  ].filter(Boolean).join(' · '))];
+  if (c.cut) nodes.push(h('p', { class: 'hint' }, `This is a long conversation. The first ${c.cut} entries are not shown.`));
+  let steps = null;
+  for (const it of c.items) {
+    if (it.role === 'tool') {
+      if (!steps) { steps = h('details', { class: 'steps' }, h('summary', null, '')); nodes.push(steps); }
+      steps.append(h('div', null, it.text));
+      steps.firstChild.textContent = plural(steps.childNodes.length - 1, 'step');
+      continue;
+    }
+    steps = null;
+    if (it.role === 'note') nodes.push(h('p', { class: 'hint' }, it.text));
+    else if (it.role === 'user') nodes.push(h('div', { class: 'msg you' }, h('div', { class: 'who' }, 'You', it.t ? h('time', null, ` · ${clock(it.t)}`) : null), h('div', { class: 'body' }, it.text)));
+    else nodes.push(h('div', { class: 'msg' }, md(it.text)));
+  }
+  nodes.push(h('p', { class: 'hint' }, 'To continue it, run in ', h('code', null, c.cwd || 'the project folder'), ': ', h('code', { style: 'user-select:all' }, `claude --resume ${c.id}`)));
+  body.replaceChildren(...nodes);
+  const scroller = $('#dlg .dlg-body');
+  scroller.scrollTop = scroller.scrollHeight;
 }
 
 // ---------------------------------------------------------------- changes and usage

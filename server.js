@@ -336,6 +336,108 @@ async function saveChanges(t, dir) {
   };
 }
 
+// ---------------------------------------------------------------- saved Claude conversations
+
+// Claude Code keeps every conversation as a file under
+// ~/.claude/projects/<folder path with every odd character turned into "-">/.
+const CLAUDE_PROJECTS = path.join(os.homedir(), '.claude', 'projects');
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const sessionDir = (dir) => path.join(CLAUDE_PROJECTS, dir.replace(/[^a-zA-Z0-9]/g, '-'));
+const sessionCache = new Map(); // file -> { key, data }
+
+function cleanPrompt(raw) {
+  let s = String(raw || '');
+  const cmd = s.match(/<command-name>([^<]*)<\/command-name>/);
+  const cmdArgs = s.match(/<command-args>([^<]*)<\/command-args>/);
+  s = s.replace(/<(system-reminder|ide_selection|ide_opened_file|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args|task-notification)>[\s\S]*?<\/\1>/g, '').trim();
+  if (cmd && !s) s = `${cmd[1]} ${cmdArgs ? cmdArgs[1] : ''}`.trim();
+  return s;
+}
+
+function parseSession(file) {
+  const stat = fs.statSync(file);
+  const key = `${stat.mtimeMs}:${stat.size}`;
+  const hit = sessionCache.get(file);
+  if (hit && hit.key === key) return hit.data;
+  const data = { id: path.basename(file, '.jsonl'), title: '', first: '', prompts: 0, cost: 0, startedAt: 0, updatedAt: stat.mtimeMs, cwd: '', items: [], tooBig: stat.size > 150e6 };
+  if (!data.tooBig) {
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      if (!line || line.startsWith('{"type":"api-request') || line.startsWith('{"type":"file-history')) continue;
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (e.type === 'ai-title' && e.aiTitle) data.title = e.aiTitle;
+      else if (e.type === 'custom-title' && e.customTitle) data.title = e.customTitle;
+      else if (e.type === 'cost-state') data.cost = Number(e.totalCostUSD) || data.cost;
+      if ((e.type !== 'user' && e.type !== 'assistant') || e.isSidechain || e.isMeta || !e.message) continue;
+      const t = Date.parse(e.timestamp) || 0;
+      if (t && !data.startedAt) data.startedAt = t;
+      if (e.cwd && !data.cwd) data.cwd = e.cwd;
+      const content = e.message.content;
+      const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
+      for (const b of blocks) {
+        if (b.type === 'text' && e.type === 'user') {
+          const s = cleanPrompt(b.text);
+          if (!s) continue;
+          if (e.isCompactSummary) { data.items.push({ role: 'note', t, text: 'Claude summarised the earlier part of this conversation here.' }); continue; }
+          data.prompts += 1;
+          if (!data.first) data.first = s.split('\n')[0].slice(0, 120);
+          data.items.push({ role: 'user', t, text: s.slice(0, 8000) });
+        } else if (b.type === 'text' && b.text && b.text.trim()) {
+          data.items.push({ role: 'assistant', t, text: b.text.trim().slice(0, 8000) });
+        } else if (b.type === 'tool_use') {
+          data.items.push({ role: 'tool', t, text: toolLine(b.name, b.input, e.cwd || data.cwd || '/') });
+        }
+      }
+    }
+  }
+  sessionCache.set(file, { key, data });
+  return data;
+}
+
+function findSessionFile(id, preferDir) {
+  if (!SESSION_ID.test(id)) return null;
+  const dirs = [];
+  if (preferDir) dirs.push(sessionDir(preferDir));
+  try { for (const d of fs.readdirSync(CLAUDE_PROJECTS)) dirs.push(path.join(CLAUDE_PROJECTS, d)); } catch { /* none saved */ }
+  for (const d of dirs) {
+    const f = path.join(d, `${id}.jsonl`);
+    if (fs.existsSync(f)) return f;
+  }
+  return null;
+}
+
+function sessionSummary(file) {
+  const { items, ...s } = parseSession(file);
+  const tasks = db.tasks.filter((t) => t.sessionId === s.id || (t.conversations || []).includes(s.id));
+  return {
+    ...s,
+    title: s.title || s.first || 'Untitled conversation',
+    steps: items.length,
+    agentTask: (tasks.find((t) => t.sessionId === s.id) || {}).id || null,
+    tasks: tasks.map((t) => t.id),
+  };
+}
+
+// The dashboard agent's own conversation plus any the user or a session linked.
+function taskConversations(t) {
+  const p = findProject(t.projectId);
+  const ids = [...new Set([t.sessionId, ...(t.conversations || [])].filter(Boolean))];
+  return ids.map((id) => {
+    const kind = id === t.sessionId ? 'agent' : 'linked';
+    const file = findSessionFile(id, p && p.path);
+    if (!file) return { id, kind, missing: true, title: 'Conversation no longer saved on this Mac' };
+    try { return { ...sessionSummary(file), kind }; } catch { return { id, kind, missing: true, title: 'Conversation could not be read' }; }
+  });
+}
+
+function linkConversation(t, id) {
+  if (!SESSION_ID.test(String(id || '')) || id === t.sessionId) return false;
+  t.conversations = t.conversations || [];
+  if (t.conversations.includes(id)) return false;
+  t.conversations.push(id);
+  return true;
+}
+
 // ---------------------------------------------------------------- agents
 
 const running = new Map(); // task id -> { child, stopped }
@@ -639,7 +741,29 @@ const api = {
     const t = findTask(m[1]);
     if (!t) throw new HttpError(404, 'That task no longer exists.');
     const { pendingFollowUp, baseTree, ...rest } = t;
-    return rest;
+    return { ...rest, conversationInfo: taskConversations(t) };
+  },
+
+  listConversations(req, res, m) {
+    const p = findProject(m[1]);
+    if (!p) throw new HttpError(404, 'That project is no longer linked.');
+    const dir = sessionDir(p.path);
+    let files = [];
+    try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl') && SESSION_ID.test(f.slice(0, -6))); } catch { /* none saved */ }
+    const list = [];
+    for (const f of files) {
+      try { list.push(sessionSummary(path.join(dir, f))); } catch { /* unreadable file */ }
+    }
+    list.sort((a, b) => b.updatedAt - a.updatedAt);
+    return { conversations: list.filter((c) => c.steps > 0 || c.tooBig) };
+  },
+
+  getConversation(req, res, m) {
+    const file = findSessionFile(m[1]);
+    if (!file) throw new HttpError(404, 'That conversation is no longer saved on this Mac.');
+    const s = parseSession(file);
+    const max = 3000;
+    return { ...sessionSummary(file), items: s.items.slice(-max), cut: Math.max(0, s.items.length - max) };
   },
 
   getChanges(req, res, m) {
@@ -744,6 +868,21 @@ const api = {
     if (!t) throw new HttpError(404, 'That task no longer exists.');
     const action = m[2];
     const who = text(body.name, 60).trim() || 'A Claude session';
+
+    if (action === 'link' || action === 'unlink') {
+      const id = String(body.sessionId || '');
+      if (!SESSION_ID.test(id)) throw new HttpError(400, 'That is not a conversation id.');
+      if (action === 'link') {
+        if (!findSessionFile(id)) throw new HttpError(404, 'That conversation is not saved on this Mac.');
+        if (linkConversation(t, id)) addLog(t, 'status', 'Conversation linked');
+      } else {
+        t.conversations = (t.conversations || []).filter((x) => x !== id);
+      }
+      changed();
+      return briefTask(t);
+    }
+    // A VS Code session that works on a task links its own conversation to it.
+    if (['claim', 'note', 'done', 'fail'].includes(action) && body.sessionId) linkConversation(t, String(body.sessionId));
 
     if (action === 'run') {
       if (t.status === 'queued' && body.force) { t.force = true; changed(); pump(); return briefTask(t); }
@@ -905,7 +1044,9 @@ const routes = [
   ['POST', /^\/api\/tasks$/, api.createTask],
   ['PATCH', /^\/api\/tasks\/(T\d+)$/, api.patchTask],
   ['DELETE', /^\/api\/tasks\/(T\d+)$/, api.deleteTask],
-  ['POST', /^\/api\/tasks\/(T\d+)\/(run|stop|claim|note|done|fail)$/, api.taskAction],
+  ['POST', /^\/api\/tasks\/(T\d+)\/(run|stop|claim|note|done|fail|link|unlink)$/, api.taskAction],
+  ['GET', /^\/api\/projects\/(P\d+)\/conversations$/, api.listConversations],
+  ['GET', /^\/api\/conversations\/([0-9a-f-]{36})$/, api.getConversation],
   ['POST', /^\/api\/projects$/, api.linkProjects],
   ['PATCH', /^\/api\/projects\/(P\d+)$/, api.patchProject],
   ['DELETE', /^\/api\/projects\/(P\d+)$/, api.deleteProject],

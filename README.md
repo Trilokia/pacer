@@ -52,6 +52,16 @@ In **New task**, choose "Add several tasks at once". Write one task per line and
 
 A link like `http://localhost:4577/#T12` opens that task.
 
+### Claude conversations
+
+Claude Code saves every conversation on this Mac, per folder. The dashboard reads them (it never changes them):
+
+- **Conversations** on a project (next to its path on the board, or in its `···` details) lists the saved conversations for that folder. Click one to read it.
+- A task's **Conversations** section shows the dashboard agent's own conversation and any you linked with **Link a conversation**.
+- A VS Code session that claims, notes or finishes a task through `dash.js` links its own conversation to that task automatically.
+
+Claude removes saved conversations after about 30 days, and chats on claude.ai are not stored on the Mac, so neither can be shown.
+
 ### Reviewing what changed
 
 A finished "Edit files" task has a **Changes** section: every file the task touched, with the added and removed lines. It compares the project with how it was when the task started, so you see only that task's work. This needs the project to be a git repository; recording it never touches your git index or history.

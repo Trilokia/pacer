@@ -138,7 +138,7 @@ The strip at the top shows today's spend and how full your Claude plan limits ar
 - **Spend limit for one agent run:** a run that reaches it stops and lands in Needs review. Each task can have its own limit.
 - **Plan-limit pause:** new agents wait when your 5-hour or weekly Claude limit is this full (90% by default), so background work does not use up what you need yourself.
 
-Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts are what the runs would cost at API prices; on a Claude subscription you are not billed them. The plan-limit numbers update each time a dashboard agent runs. While tasks are paused by a full limit, the dashboard reads the limit again every 5 minutes, so a limit that was reset early is noticed and the queue starts again. **Check now** in the Usage dialog reads it right away.
+Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts are what the runs would cost at API prices; on a Claude subscription you are not billed them. The plan-limit numbers update each time a dashboard agent runs. While tasks are paused by a full limit, the dashboard reads the limit again every 5 minutes, so a limit that was reset early is noticed and the queue starts again. **Refresh** reads it right away: the ↻ button next to the usage strip, or the Refresh button in the Usage dialog.
 
 ### Usage mode
 

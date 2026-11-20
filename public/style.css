@@ -429,3 +429,8 @@ dialog::backdrop { background: rgb(0 0 0 / 32%); }
 .mode-row strong { font-weight: 650; }
 .mode-row .hint { grid-column: 2; }
 .chip.plan { background: var(--review-soft); color: var(--review); }
+
+/* ---------- refresh usage */
+.btn.icon { padding: 5px 10px; font-size: 17px; line-height: 1.2; }
+.sect-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.sect-head .sect-title { margin: 0; }

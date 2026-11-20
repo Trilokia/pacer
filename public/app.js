@@ -353,6 +353,7 @@ function render() {
     banner.hidden = true;
   }
   $('#btn-suggest').hidden = !v2() || !S.projects.length;
+  $('#usage-refresh').hidden = !serverHas(3) || !S.usage;
   const pick = $('#usage-mode');
   pick.hidden = !serverHas(5);
   if (document.activeElement !== pick) pick.value = usageMode();
@@ -1556,9 +1557,36 @@ async function setUsageMode(mode) {
   toast(`Usage mode: ${m[1]}. It applies to agents that start from now on.`);
 }
 
-function usageDialog() {
+// Reads your Claude limits afresh (one tiny Haiku call) and reloads the
+// numbers. Gives true when it worked.
+let usageBusy = false;
+async function refreshUsage(button) {
+  if (usageBusy) return false;
+  usageBusy = true;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = button.dataset.busy || 'Refreshing…';
+  let ok = false;
+  try {
+    await api('POST', '/api/limits/check');
+    await refresh();
+    ok = true;
+    const w = (S.usage.limits && S.usage.limits.windows) || {};
+    const pct = (key) => (w[key] && w[key].resetsAt > Date.now() ? `${Math.round(w[key].utilization * 100)}%` : null);
+    const bits = [pct('five_hour') && `5-hour limit ${pct('five_hour')}`, pct('seven_day') && `weekly ${pct('seven_day')}`].filter(Boolean);
+    toast(`Usage refreshed${bits.length ? `: ${bits.join(', ')}` : ''}.${S.usage.hold ? ' The queue is still paused.' : ''}`);
+  } catch { /* the error is already shown */ }
+  usageBusy = false;
+  button.disabled = false;
+  button.textContent = label;
+  return ok;
+}
+
+// draft: what was typed in the budget boxes, kept when the dialog redraws.
+function usageDialog(draft = {}) {
   const u = S.usage;
   const s = S.settings;
+  const typed = (key, saved) => (key in draft ? draft[key] : saved > 0 ? String(saved) : '');
   const tile = (label, value, note) => h('div', { class: 'tile' }, h('div', { class: 'tile-label' }, label), h('div', { class: 'tile-value' }, value), note && h('div', { class: 'hint' }, note));
   const limits = [];
   for (const [key, label] of [['five_hour', '5-hour limit'], ['seven_day', 'Weekly limit']]) {
@@ -1573,25 +1601,19 @@ function usageDialog() {
   }
   const rows = Object.entries(u.byProject).sort((a, b) => b[1].month - a[1].month || b[1].all - a[1].all);
   const name = (pid) => (S.projects.find((p) => p.id === pid) || { name: '(removed project)' }).name;
-  const daily = h('input', { type: 'number', min: 0, step: 1, value: s.dailyBudget > 0 ? String(s.dailyBudget) : '', placeholder: 'No limit' });
-  const perRun = h('input', { type: 'number', min: 0, step: 0.5, value: s.taskBudget > 0 ? String(s.taskBudget) : '', placeholder: usageMode() === 'saver' ? `Saver: ${money(u.saverBudget)}` : 'No limit' });
-  const hold = h('input', { type: 'number', min: 0, max: 100, step: 5, value: s.holdPercent > 0 ? String(s.holdPercent) : '', placeholder: 'Never' });
-  // Reads the limits afresh, for when you know they changed (a reset, say).
-  const check = serverHas(3) && h('button', { class: 'link', onclick: async () => {
-    check.disabled = true;
-    check.textContent = 'Checking…';
-    try {
-      await api('POST', '/api/limits/check');
-      await refresh();
-      usageDialog();
-      toast(S.usage.hold ? 'Checked: still paused.' : 'Checked. Your limits are up to date.');
-    } catch { check.disabled = false; check.textContent = 'Check now'; }
-  } }, 'Check now');
+  const daily = h('input', { type: 'number', min: 0, step: 1, value: typed('daily', s.dailyBudget), placeholder: 'No limit' });
+  const perRun = h('input', { type: 'number', min: 0, step: 0.5, value: typed('perRun', s.taskBudget), placeholder: usageMode() === 'saver' ? `Saver: ${money(u.saverBudget)}` : 'No limit' });
+  const hold = h('input', { type: 'number', min: 0, max: 100, step: 5, value: typed('hold', s.holdPercent), placeholder: 'Never' });
+  const redraw = () => usageDialog({ daily: daily.value, perRun: perRun.value, hold: hold.value });
+  // For when you know the limits changed (a reset, or heavy use in VS Code).
+  const refreshBtn = serverHas(3) && h('button', { class: 'btn small', title: 'Read your Claude limits again now', onclick: async () => {
+    if (await refreshUsage(refreshBtn) && $('#dlg').open && $('#dlg').contains(refreshBtn)) redraw();
+  } }, 'Refresh');
 
   const modeBox = serverHas(5) && h('div', null,
     h('div', { class: 'sect-title' }, 'Usage mode'),
     h('div', { class: 'modes' }, USAGE_MODES.map(([key, label, about]) => h('label', { class: `mode-row${usageMode() === key ? ' on' : ''}` },
-      h('input', { type: 'radio', name: 'usage-mode', checked: usageMode() === key, onchange: async () => { await setUsageMode(key); usageDialog(); } }),
+      h('input', { type: 'radio', name: 'usage-mode', checked: usageMode() === key, onchange: async () => { await setUsageMode(key); redraw(); } }),
       h('strong', null, label),
       h('span', { class: 'hint' }, about)))),
     h('p', { class: 'hint', style: 'margin-top:8px' }, 'In Saver and Balanced, agents also start by how much of your 5-hour limit they are likely to take, not just by how many are running: a new one starts only if it fits under the pause level below, next to those already running. In every mode, an agent that a limit cuts off waits for the reset and then continues by itself.'));
@@ -1614,10 +1636,10 @@ function usageDialog() {
       tile('This week', money(u.totals.week)),
       tile('This month', money(u.totals.month))),
     h('div', null,
-      h('div', { class: 'sect-title' }, 'Your Claude plan limits'),
+      h('div', { class: 'sect-head' }, h('div', { class: 'sect-title' }, 'Your Claude plan limits'), refreshBtn),
       limits.length
-        ? [h('div', { class: 'limits' }, limits), h('p', { class: 'hint', style: 'margin-top:8px' }, `As of ${ago(u.limits.at)}. This updates each time a dashboard agent runs, and every few minutes while tasks are paused by a limit. Your own Claude sessions use the same limits, so the real number can differ. `, check)]
-        : h('p', { class: 'hint' }, 'Shown after the first agent run. ', check)),
+        ? [h('div', { class: 'limits' }, limits), h('p', { class: 'hint', style: 'margin-top:8px' }, `As of ${ago(u.limits.at)}. This updates each time a dashboard agent runs, and every few minutes while tasks are paused by a limit. Your own Claude sessions use the same limits, so press Refresh when you want the number as it is right now.`)]
+        : h('p', { class: 'hint' }, 'Not read yet. Press Refresh, or wait for the first agent run.')),
     typical,
     h('div', null, h('div', { class: 'sect-title' }, 'Spend per day, last 14 days'), spendChart(u.days)),
     rows.length ? h('div', null,
@@ -1650,7 +1672,8 @@ $('#btn-settings').addEventListener('click', settingsDialog);
 $('#btn-suggest').addEventListener('click', suggestDialog);
 $('#usage-mode').addEventListener('change', (e) => setUsageMode(e.target.value));
 $('#dlg').addEventListener('close', () => { ui.onState = null; });
-$('#usage').addEventListener('click', usageDialog);
+$('#usage').addEventListener('click', () => usageDialog());
+$('#usage-refresh').addEventListener('click', (e) => refreshUsage(e.currentTarget));
 $('#btn-refresh').addEventListener('click', () => refresh(true).then(() => toast('Project info refreshed.')).catch(() => {}));
 $('#proj-sort').replaceChildren(...PROJECT_SORTS.map(([v, label]) => h('option', { value: v }, label)));
 $('#proj-sort').value = projSort();

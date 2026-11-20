@@ -29,7 +29,18 @@ const INFO_TTL_MS = 15000;
 const MODES = ['plan', 'edit'];
 const PRIORITIES = ['low', 'normal', 'high'];
 const PROJECT_STATUSES = ['active', 'paused', 'shipped'];
-const MODELS = ['', 'haiku', 'sonnet', 'opus', 'fable'];
+const MODELS = ['', 'auto', 'haiku', 'sonnet', 'opus', 'fable'];
+// The levels the automatic model choice picks from, cheapest first.
+const TIERS = [
+  { key: 'eco', label: 'Eco', model: 'haiku' },
+  { key: 'efficient', label: 'Efficient', model: 'sonnet' },
+  { key: 'optimized', label: 'Optimized', model: 'opus' },
+  { key: 'max', label: 'Max', model: 'fable' },
+];
+const TIER_KEYS = TIERS.map((x) => x.key);
+// The page checks this number, so a page that is newer than the running
+// server can hide what the server cannot do yet.
+const API_VERSION = 2;
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -43,7 +54,8 @@ let db = {
   pseq: 1,
   // taskBudget and dailyBudget are in US dollars, 0 = no limit. holdPercent
   // pauses the queue when a Claude plan limit is that full, 0 = never.
-  settings: { maxAgents: 2, defaultModel: '', claudePath: '', taskBudget: 0, dailyBudget: 0, holdPercent: 90 },
+  // autoMax is the strongest level the automatic model choice may pick.
+  settings: { maxAgents: 2, defaultModel: '', claudePath: '', taskBudget: 0, dailyBudget: 0, holdPercent: 90, autoMax: 'max' },
   projects: [],
   tasks: [],
   spend: [],     // one entry per agent run: { at, taskId, projectId, cost, model }
@@ -146,11 +158,12 @@ function detectType(dir) {
 const infoCache = new Map(); // project id -> { at, info }
 
 async function computeInfo(dir) {
-  const info = { exists: false, type: 'Folder', git: null, hasClaudeMd: false };
+  const info = { exists: false, type: 'Folder', git: null, hasClaudeMd: false, notes: 0 };
   try { info.exists = fs.statSync(dir).isDirectory(); } catch { /* missing */ }
   if (!info.exists) return info;
   info.type = detectType(dir);
   info.hasClaudeMd = fs.existsSync(path.join(dir, 'CLAUDE.md'));
+  info.notes = findNotes(dir).files.length;
   if (!fs.existsSync(path.join(dir, '.git'))) return info;
   const st = await sh('git', ['-C', dir, 'status', '--porcelain=v1', '-b']);
   if (!st.ok) return info;
@@ -216,9 +229,10 @@ function usage() {
       if (e.at >= start.week) bucket.week += e.cost;
       if (e.at >= start.day) bucket.today += e.cost;
     }
-    row.runs += 1;
+    const run = e.check ? 0 : 1; // the quick model check is spend, but not an agent run
+    row.runs += run;
     for (let i = days.length - 1; i >= 0; i--) {
-      if (e.at >= days[i].at) { days[i].cost += e.cost; days[i].runs += 1; break; }
+      if (e.at >= days[i].at) { days[i].cost += e.cost; days[i].runs += run; break; }
     }
   }
   return { totals, byProject, days, limits: db.limits, hold: holdReason() };
@@ -440,6 +454,267 @@ function linkConversation(t, id) {
   return true;
 }
 
+// ---------------------------------------------------------------- notes and plan files
+
+const NOTE_DIRS = ['docs', 'doc', 'plans', 'plan', 'notes'];
+const NOTE_FILE = /\.(md|markdown)$|^todo(\.txt)?$/i;
+const NOT_NOTES = /^(licen[sc]e|code_of_conduct|contributing|security)\b/i;
+
+// The notes a "what is next" scan should read: markdown files at the top of
+// the project and in its docs / plans folders. A project inside a workspace
+// that has a shared CLAUDE.md also gets that workspace's plans and docs.
+// `outside` lists the folders outside the project the agent needs to read.
+function findNotes(dir) {
+  const files = [];
+  const outside = [];
+  const take = (d) => {
+    let names = [];
+    try { names = fs.readdirSync(d).sort(); } catch { return 0; }
+    let n = 0;
+    for (const name of names) {
+      if (n >= 12) break;
+      if (!NOTE_FILE.test(name) || NOT_NOTES.test(name)) continue;
+      const f = path.join(d, name);
+      try { const st = fs.statSync(f); if (!st.isFile() || !st.size) continue; } catch { continue; }
+      files.push(f);
+      n++;
+    }
+    return n;
+  };
+  take(dir);
+  for (const sub of NOTE_DIRS) take(path.join(dir, sub));
+  const parent = path.dirname(dir);
+  if (parent !== dir && parent !== os.homedir() && fs.existsSync(path.join(parent, 'CLAUDE.md'))) {
+    for (const sub of NOTE_DIRS) {
+      const d = path.join(parent, sub);
+      if (take(d)) outside.push(d);
+    }
+  }
+  return { files, outside };
+}
+
+// ---------------------------------------------------------------- automatic model choice
+
+const TIER_GUIDE = [
+  'eco: fixed commands or collecting information, with no judgment needed (run the tests and report, take screenshots, list or read files, read a log).',
+  'efficient: a small, clearly described change in a few files (rename something, add a string or resource, fix a typo, write a test for behaviour that is already described, summarise).',
+  'optimized: a feature that touches several files, a bug where the cause is partly known, planning a feature, reviewing code.',
+  'max: the hardest work (design or architecture decisions, a bug with an unknown cause, security or privacy, anything about a store release or store policy, a large rewrite).',
+];
+const CLASSIFY_PROMPT = [
+  'You sort software tasks by how capable an AI model they need, so that simple tasks do not use an expensive model.',
+  'The task text may have typing mistakes. Read it for what the person means.',
+  'Pick the lowest level that can do the task well:',
+  ...TIER_GUIDE,
+  'A vague or open-ended task needs more judgment, so it is at least "optimized".',
+  'Give the level and a reason of at most 12 plain words.',
+].join('\n');
+const CLASSIFY_SCHEMA = {
+  type: 'object',
+  properties: { tier: { type: 'string', enum: TIER_KEYS }, why: { type: 'string' } },
+  required: ['tier', 'why'],
+  additionalProperties: false,
+};
+
+// The environment for a claude program started by the dashboard. The server
+// may itself have been started from inside a Claude session.
+function agentEnv() {
+  const env = { ...process.env };
+  for (const k of ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT']) delete env[k];
+  return env;
+}
+
+// Asks the cheapest model what kind of task this is. It takes a few seconds
+// and costs a fraction of a cent. Gives null when there is no usable answer.
+function classifyTask(t, p, bin) {
+  return new Promise((resolve) => {
+    const args = ['-p', '--model', 'haiku', '--safe-mode', '--tools', '', '--system-prompt', CLASSIFY_PROMPT,
+      '--output-format', 'json', '--json-schema', JSON.stringify(CLASSIFY_SCHEMA), '--no-session-persistence'];
+    const info = (infoCache.get(p.id) || {}).info;
+    const ask = [
+      `Kind of project: ${info ? info.type : 'unknown'}`,
+      `The agent may: ${t.mode === 'edit' ? 'edit files' : 'only read and write a plan'}`,
+      `Title: ${t.title}`,
+      t.description ? `Details: ${t.description.slice(0, 3000)}` : '',
+    ].filter(Boolean).join('\n');
+    let child;
+    try {
+      child = execFile(bin, args, { cwd: os.tmpdir(), env: agentEnv(), timeout: 40000, maxBuffer: 4e6 }, (err, stdout) => {
+        let r = null;
+        try { r = JSON.parse(String(stdout)); } catch { /* no answer */ }
+        if (Array.isArray(r)) r = r[r.length - 1];
+        if (!r || typeof r !== 'object') return resolve(null);
+        const cost = Number(r.total_cost_usd) || 0;
+        if (cost) {
+          t.cost = (t.cost || 0) + cost;
+          db.spend.push({ at: Date.now(), taskId: t.id, projectId: t.projectId, cost, model: 'haiku', check: true });
+        }
+        const out = r.structured_output;
+        resolve(out && TIER_KEYS.includes(out.tier) ? { tier: out.tier, why: String(out.why || '').slice(0, 160).trim() } : null);
+      });
+    } catch { return resolve(null); }
+    child.stdin.on('error', () => {});
+    child.stdin.end(ask);
+  });
+}
+
+// Word rules, used only when the quick check gives no answer.
+function guessTier(t) {
+  const s = `${t.title}\n${t.description || ''}`.toLowerCase();
+  if (/architect|redesign|security|privacy|policy|release|publish|play store|migrat|rewrite|root cause|not sure why|unknown/.test(s)) return 'max';
+  if (s.length < 400 && /\b(rename|typo|spelling|string|label|wording|colou?r|icon|bump|version|comment)\b/.test(s)) return 'efficient';
+  if (t.mode === 'plan' && s.length < 300 && /\b(list|count|find where|which files?|screenshot|logcat|run the tests?)\b/.test(s)) return 'eco';
+  return 'optimized';
+}
+
+// The level to really use: never above the limit set in Settings.
+function capTier(key) {
+  const i = Math.max(0, TIER_KEYS.indexOf(key));
+  const top = TIER_KEYS.indexOf(db.settings.autoMax);
+  return TIERS[Math.min(i, top < 0 ? TIERS.length - 1 : top)];
+}
+
+// Sets t.auto: the level and model the automatic choice gives this run.
+async function chooseModel(t, p, bin) {
+  let found = null;
+  if (t.kind === 'scan') {
+    // No check needed: reading notes is light work, judging code is not.
+    found = t.scan && t.scan.code
+      ? { tier: 'optimized', why: 'judging the code needs a stronger model' }
+      : { tier: 'efficient', why: 'reading notes and plans is light work' };
+  } else {
+    try { found = await classifyTask(t, p, bin); } catch { /* fall back to the word rules */ }
+    if (!found) found = { tier: guessTier(t), why: 'chosen by simple word rules, because the quick check gave no answer' };
+  }
+  const tier = capTier(found.tier);
+  const why = found.why.replace(/[.\s]+$/, '');
+  t.auto = { tier: tier.key, model: tier.model, why, at: Date.now() };
+  addLog(t, 'status', `Auto picked ${tier.label} (${tier.model}): ${why}.${tier.key !== found.tier ? ` Settings limit Auto to ${tier.label}.` : ''}`);
+  changed();
+}
+
+// ---------------------------------------------------------------- "what is next" scans
+
+const SCAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    suggestions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          details: { type: 'string' },
+          source: { type: 'string', enum: ['notes', 'idea'] },
+          from: { type: 'string' },
+          mode: { type: 'string', enum: MODES },
+          size: { type: 'string', enum: TIER_KEYS },
+          priority: { type: 'string', enum: PRIORITIES },
+        },
+        required: ['title', 'details', 'source', 'from', 'mode', 'size', 'priority'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['summary', 'suggestions'],
+  additionalProperties: false,
+};
+
+function scanPrompt(t, p) {
+  const want = t.scan || { notes: true, code: false };
+  const notes = want.notes ? findNotes(p.path).files : [];
+  const rel = (f) => { const r = path.relative(p.path, f); return r.startsWith('..') ? f : r; };
+  const info = (infoCache.get(p.id) || {}).info;
+  const board = db.tasks.filter((x) => x.projectId === p.id && x.kind !== 'scan');
+  const state = { todo: 'to do', queued: 'to do', running: 'in progress', review: 'worked on, waiting for review', done: 'done' };
+  const lines = [
+    `The user builds several projects alone and wants to know where the project "${p.name}" stands and what to work on next.`,
+    'Your suggestions become tasks on their task board. The user, or another AI agent that has not seen this conversation, picks the tasks up later, so each one has to make sense by itself.',
+    'Look at the project and change nothing.',
+    '',
+  ];
+  if (notes.length) {
+    lines.push(
+      'Start from the notes and plan files, because they say what the user means to build. These exist:',
+      ...notes.map((f) => `- ${rel(f)}`),
+      'Read the ones about this project. Files outside the project folder may also cover sibling projects: use only the parts about this one. If CLAUDE.md names a plan file for this project, that is the one to read.',
+      'Compare what the notes say should exist with what the code really has, and list what is still left to do. Notes go out of date, so check the code before you call something missing.',
+      '');
+  } else if (want.notes) {
+    lines.push('This project has no notes or plan files, so work out what it is for from the code and the git history.', '');
+  }
+  if (want.code) {
+    lines.push(
+      `${notes.length ? 'Then look' : 'Look'} at the code with fresh eyes and add your own ideas${notes.length ? ' that the notes do not mention' : ''}: likely bugs, missing tests, things that would block a release, rough edges a user would notice.`,
+      'Useful places: the folder layout, the build files, TODO and FIXME comments, and the recent git history. Suggest only what you have a concrete reason for in this code.',
+      '');
+  } else {
+    lines.push('Keep this quick: read the notes, the folder layout and the recent git history. Open code files only to check whether something is already done.', '');
+  }
+  const facts = [`Today is ${new Date().toISOString().slice(0, 10)}.`];
+  if (info && info.exists) facts.push(`Kind of project: ${info.type}.`);
+  if (p.deadline) facts.push(`The user's deadline for it: ${p.deadline}.`);
+  if (p.notes && p.notes.trim()) facts.push(`The user's own note about it: ${p.notes.trim().slice(0, 1500)}`);
+  lines.push(...facts, '');
+  if (t.description && t.description.trim()) lines.push(`The user asks you to focus on: ${t.description.trim()}`, '');
+  if (board.length) {
+    lines.push(
+      'These tasks are already on the board for this project. Do not suggest them again:',
+      ...board.slice(-40).map((x) => `- ${x.id} (${state[x.status] || x.status}): ${x.title}`),
+      '');
+  }
+  lines.push(
+    'Give back:',
+    '- summary: where the project stands, in 3 to 6 short sentences of plain, simple English.',
+    '- suggestions: at most 10, the most useful first. A few good ones are better than many vague ones. For each:',
+    '  - title: starts with a verb, under 80 characters.',
+    '  - details: the whole brief for whoever does the task. What to change, where (file or screen names), and how to tell it worked. 2 to 5 sentences.',
+    '  - source: "notes" when it is left over from the notes or plan, "idea" when it is your own suggestion.',
+    '  - from: the file and section it comes from, or the code that made you suggest it. A few words.',
+    '  - mode: "edit" when the work is clear enough to simply do, "plan" when it needs a decision or a design first.',
+    '  - size: how capable a model the task needs. Pick the lowest that can do it well:',
+    ...TIER_GUIDE.map((g) => `    - ${g}`),
+    '  - priority: "high" only when it blocks a release or breaks the app, "low" for nice-to-haves, otherwise "normal".',
+  );
+  return lines.join('\n');
+}
+
+// Finds a JSON object in an answer that was meant to be only JSON.
+function looseJson(s) {
+  s = String(s || '');
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  for (const part of [fence && fence[1], s.slice(s.indexOf('{'), s.lastIndexOf('}') + 1)]) {
+    if (!part) continue;
+    try { return JSON.parse(part); } catch { /* try the next form */ }
+  }
+  return null;
+}
+
+// Checks and tidies what a scan gave back. `run` keeps suggestion ids from
+// different runs of the same scan apart.
+function readSuggestions(obj, run) {
+  if (!obj || typeof obj !== 'object' || !Array.isArray(obj.suggestions)) return null;
+  const clip = (v, max) => String(v == null ? '' : v).slice(0, max).trim();
+  const suggestions = [];
+  for (const s of obj.suggestions.slice(0, 20)) {
+    const title = clip(s && s.title, 200);
+    if (!title) continue;
+    suggestions.push({
+      id: `r${run}s${suggestions.length + 1}`,
+      title,
+      details: clip(s.details, 4000),
+      source: s.source === 'notes' ? 'notes' : 'idea',
+      from: clip(s.from, 200),
+      mode: MODES.includes(s.mode) ? s.mode : 'plan',
+      size: TIER_KEYS.includes(s.size) ? s.size : 'optimized',
+      priority: PRIORITIES.includes(s.priority) ? s.priority : 'normal',
+      taskId: null,
+    });
+  }
+  return { summary: clip(obj.summary, 4000), suggestions };
+}
+
 // ---------------------------------------------------------------- agents
 
 const running = new Map(); // task id -> { child, stopped }
@@ -478,6 +753,14 @@ function findClaude() {
 }
 
 function systemPrompt(t) {
+  if (t.kind === 'scan') {
+    return [
+      "You are a background agent started from the user's project dashboard to look at one project and suggest what to do next.",
+      'Nobody can answer questions while you run. Do not ask questions: make a sensible choice.',
+      "This is a read-only job: do not change, create or delete any files, and never run git commit or git push. Follow the project's CLAUDE.md.",
+      'Write for the user in plain, simple English.',
+    ].join('\n');
+  }
   const lines = [
     "You are a background agent started from the user's project dashboard to do one task.",
     'Nobody can answer questions while you run. Do not ask questions: make a sensible choice and say what you chose in your report.',
@@ -492,6 +775,7 @@ function systemPrompt(t) {
 }
 
 function firstPrompt(t, p) {
+  if (t.kind === 'scan') return scanPrompt(t, p);
   return [
     `Task ${t.id} for the project "${p.name}": ${t.title}`,
     t.description ? `\n${t.description}` : '',
@@ -517,6 +801,7 @@ function toolLine(name, input, cwd) {
     case 'WebFetch': return `Fetch ${cut(input.url, 100)}`;
     case 'WebSearch': return `Web search: ${cut(input.query, 100)}`;
     case 'ExitPlanMode': return 'Plan ready';
+    case 'StructuredOutput': return 'Writing up the suggestions';
     default: return name;
   }
 }
@@ -564,6 +849,10 @@ function startAgent(t) {
     t.changes = null;
     ready = snapshotTree(p.path).then((tree) => { t.baseTree = tree; }).catch(() => { t.baseTree = null; });
   }
+  // "Auto" first finds out what kind of task this is. A follow-up stays on
+  // the model the first run was given.
+  if ((t.model || db.settings.defaultModel) !== 'auto') delete t.auto;
+  else if (!(resume && t.auto)) ready = Promise.all([ready, chooseModel(t, p, bin)]);
   ready.then(() => {
     if (st.stopped) { st.done = true; return finish(t, 'stopped', 'Stopped by you.'); }
     launchAgent(t, p, st, bin, resume, followUp);
@@ -576,9 +865,16 @@ function launchAgent(t, p, st, bin, resume, followUp) {
     '--permission-mode', t.mode === 'edit' ? 'auto' : 'plan',
     '--append-system-prompt', systemPrompt(t),
   ];
-  const model = t.model || db.settings.defaultModel;
+  const wanted = t.model || db.settings.defaultModel;
+  const model = wanted === 'auto' ? (t.auto && t.auto.model) : wanted;
   if (model) args.push('--model', model);
   if (resume) args.push('--resume', t.sessionId);
+  if (t.kind === 'scan') {
+    // The answer has to come back as data the board can turn into tasks.
+    args.push('--json-schema', JSON.stringify(SCAN_SCHEMA));
+    const outside = t.scan && t.scan.notes === false ? [] : findNotes(p.path).outside;
+    if (outside.length) args.push('--add-dir', ...outside);
+  }
   const budget = Number(t.budget) > 0 ? Number(t.budget) : db.settings.taskBudget;
   if (budget > 0) args.push('--max-budget-usd', String(budget));
   // Three layers keep agents from committing or pushing: a check that runs
@@ -591,9 +887,9 @@ function launchAgent(t, p, st, bin, resume, followUp) {
 
   let prompt = resume ? followUp : firstPrompt(t, p);
   if (followUp && !resume) prompt += `\n\n${followUp}`;
+  if (resume && t.kind === 'scan') prompt += '\n\nThen give the complete, updated summary and list of suggestions again.';
 
-  const env = { ...process.env };
-  for (const k of ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT']) delete env[k];
+  const env = agentEnv();
   const n = Number(env.GIT_CONFIG_COUNT) || 0;
   env.GIT_CONFIG_COUNT = String(n + 1);
   env[`GIT_CONFIG_KEY_${n}`] = 'core.hooksPath';
@@ -643,16 +939,28 @@ function launchAgent(t, p, st, bin, resume, followUp) {
       const tail = st.stderr.trim().split('\n').slice(-3).join(' ');
       return finish(t, 'failed', `The agent ended without a result (exit code ${code}). ${tail}`.trim());
     }
-    let text = typeof r.result === 'string' ? r.result.trim() : '';
-    if (st.plan && text.length < st.plan.length) text = st.plan;
+    let answer = typeof r.result === 'string' ? r.result.trim() : '';
+    if (st.plan && answer.length < st.plan.length) answer = st.plan;
     if (r.is_error) {
-      t.report = text || t.report || '';
+      t.report = answer || t.report || '';
       if (/budget/i.test(r.subtype || '')) {
         return finish(t, 'failed', `Stopped: this run reached its spend limit ($${Number(r.total_cost_usd || 0).toFixed(2)}). Raise the limit or send a follow-up to continue.`);
       }
       return finish(t, 'failed', `The agent stopped with an error (${r.subtype || 'unknown'}).`);
     }
-    t.report = text || '(The agent finished without writing a report.)';
+    if (t.kind === 'scan') {
+      const got = readSuggestions(r.structured_output, t.runs) || readSuggestions(looseJson(answer), t.runs);
+      if (!got) {
+        t.report = answer;
+        return finish(t, 'failed', 'The agent did not give its suggestions in a form the board can read. Its answer is shown as the report.');
+      }
+      t.summary = got.summary;
+      t.suggestions = got.suggestions;
+      t.report = got.summary;
+      const count = got.suggestions.length;
+      return finish(t, 'ok', count ? `${count} suggestion${count === 1 ? '' : 's'} ready. Tick the ones you want as tasks.` : 'Finished: nothing to suggest right now.');
+    }
+    t.report = answer || '(The agent finished without writing a report.)';
     finish(t, 'ok', 'Agent finished. Waiting for your review.');
   };
   child.on('error', (e) => end(null, e));
@@ -726,6 +1034,39 @@ function pick(value, allowed, what) {
 const text = (v, max) => String(v == null ? '' : v).slice(0, max);
 const agentBusy = (t) => t.status === 'queued' || (t.status === 'running' && t.assignee && t.assignee.kind === 'agent');
 
+function newTask(f) {
+  const now = Date.now();
+  return {
+    id: `T${db.seq++}`,
+    projectId: f.projectId,
+    title: f.title,
+    description: f.description || '',
+    status: 'todo',
+    outcome: null,
+    mode: f.mode || 'plan',
+    model: f.model || '',
+    priority: f.priority || 'normal',
+    budget: f.budget || 0,
+    assignee: null,
+    report: '',
+    sessionId: null,
+    cost: 0,
+    runs: 0,
+    steps: 0,
+    log: [],
+    logTotal: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function queueTask(t) {
+  t.status = 'queued';
+  t.queuedAt = Date.now();
+  t.outcome = null;
+  t.assignee = { kind: 'agent', name: '' };
+}
+
 const api = {
   async getState(req, res, m, body, url) {
     const fresh = url.searchParams.get('fresh') === '1';
@@ -735,7 +1076,7 @@ const api = {
       projects,
       tasks: db.tasks.map(briefTask),
       usage: usage(),
-      meta: { claude: findClaude(), running: running.size, suggestRoot: path.dirname(__dirname), home: os.homedir(),
+      meta: { version: API_VERSION, claude: findClaude(), running: running.size, suggestRoot: path.dirname(__dirname), home: os.homedir(),
         system: { memGb: Math.round(os.totalmem() / 2 ** 30), cores: os.cpus().length } },
     };
   },
@@ -786,35 +1127,82 @@ const api = {
     const title = text(body.title, 200).trim();
     if (!title) throw new HttpError(400, 'Give the task a title.');
     if (!findProject(body.projectId)) throw new HttpError(400, 'Choose a project for this task.');
-    const now = Date.now();
-    const t = {
-      id: `T${db.seq++}`,
+    const fields = {
       projectId: body.projectId,
       title,
       description: text(body.description, 20000),
-      status: 'todo',
-      outcome: null,
       mode: pick(body.mode || 'plan', MODES, 'mode'),
       model: pick(body.model || '', MODELS, 'model'),
       priority: pick(body.priority || 'normal', PRIORITIES, 'priority'),
       budget: Math.max(0, Number(body.budget) || 0),
-      assignee: null,
-      report: '',
-      sessionId: null,
-      cost: 0,
-      runs: 0,
-      steps: 0,
-      log: [],
-      logTotal: 0,
-      createdAt: now,
-      updatedAt: now,
     };
+    const t = newTask(fields);
     addLog(t, 'status', body.by ? `Task added by ${text(body.by, 60)}` : 'Task added');
     db.tasks.push(t);
-    if (body.run) { t.status = 'queued'; t.queuedAt = now; t.assignee = { kind: 'agent', name: '' }; }
+    if (body.run) queueTask(t);
     changed();
     pump();
     return briefTask(t);
+  },
+
+  // Starts a read-only "what is next" scan in each chosen project. A project
+  // keeps one open scan; asking again runs that same one again.
+  suggest(req, res, m, body) {
+    const notes = body.notes !== false;
+    const code = Boolean(body.code);
+    if (!notes && !code) throw new HttpError(400, 'Choose what to look at: the notes, the code, or both.');
+    const model = pick(body.model == null ? 'auto' : body.model, MODELS, 'model');
+    const focus = text(body.focus, 2000).trim();
+    const out = [];
+    for (const pid of Array.isArray(body.projectIds) ? body.projectIds : []) {
+      if (!findProject(pid)) continue;
+      let t = db.tasks.find((x) => x.kind === 'scan' && x.projectId === pid && x.status !== 'done');
+      if (t && (t.status === 'running' || t.status === 'queued')) { out.push(t); continue; }
+      if (!t) {
+        t = newTask({ projectId: pid, title: 'Suggest what to do next', mode: 'plan' });
+        t.kind = 'scan';
+        addLog(t, 'status', 'Suggestions asked for');
+        db.tasks.push(t);
+      }
+      t.scan = { notes, code };
+      t.model = model;
+      t.description = focus;
+      delete t.pendingFollowUp;
+      queueTask(t);
+      out.push(t);
+    }
+    if (!out.length) throw new HttpError(400, 'Choose at least one project.');
+    changed();
+    pump();
+    return { tasks: out.map(briefTask) };
+  },
+
+  // Turns the chosen suggestions of a scan into tasks on the board.
+  adopt(req, res, m, body) {
+    const t = findTask(m[1]);
+    if (!t || t.kind !== 'scan') throw new HttpError(404, 'Those suggestions no longer exist.');
+    const made = [];
+    for (const item of Array.isArray(body.items) ? body.items : []) {
+      const s = (t.suggestions || []).find((x) => x.id === (item && item.id));
+      if (!s || (s.taskId && findTask(s.taskId))) continue;
+      const n = newTask({
+        projectId: t.projectId,
+        title: s.title,
+        description: [s.details, s.from ? `Where this comes from: ${s.from}` : ''].filter(Boolean).join('\n\n'),
+        mode: pick(item.mode || s.mode, MODES, 'mode'),
+        model: capTier(s.size).model, // the scan already sized the task
+        priority: s.priority,
+      });
+      addLog(n, 'status', `Task added from the suggestions in ${t.id}`);
+      db.tasks.push(n);
+      s.taskId = n.id;
+      if (body.run) queueTask(n);
+      made.push(n);
+    }
+    t.updatedAt = Date.now();
+    changed();
+    pump();
+    return { tasks: made.map(briefTask) };
   },
 
   patchTask(req, res, m, body) {
@@ -828,8 +1216,9 @@ const api = {
     for (const k of ['mode', 'model', 'projectId']) {
       if (!(k in body) || body[k] === t[k]) continue;
       if (locked) throw new HttpError(409, 'Stop the agent before changing this.');
+      if (t.kind === 'scan' && k !== 'model') throw new HttpError(409, 'A suggestions scan stays read-only and in its own project.');
       if (k === 'mode') t.mode = pick(body.mode, MODES, 'mode');
-      if (k === 'model') t.model = pick(body.model, MODELS, 'model');
+      if (k === 'model') { t.model = pick(body.model, MODELS, 'model'); delete t.auto; }
       if (k === 'projectId') {
         if (!findProject(body.projectId)) throw new HttpError(400, 'Unknown project.');
         t.projectId = body.projectId;
@@ -890,14 +1279,11 @@ const api = {
     if (action === 'run') {
       if (t.status === 'queued' && body.force) { t.force = true; changed(); pump(); return briefTask(t); }
       if (t.status === 'running' || t.status === 'queued') throw new HttpError(409, 'This task is already running or queued.');
-      if (body.mode) t.mode = pick(body.mode, MODES, 'mode');
+      if (body.mode && t.kind !== 'scan') t.mode = pick(body.mode, MODES, 'mode');
       const message = text(body.message, 20000).trim();
       if (message) { t.pendingFollowUp = message; addLog(t, 'you', message); } else delete t.pendingFollowUp;
       if (body.force) t.force = true;
-      t.status = 'queued';
-      t.queuedAt = Date.now();
-      t.outcome = null;
-      t.assignee = { kind: 'agent', name: '' };
+      queueTask(t);
       changed();
       pump();
     } else if (action === 'stop') {
@@ -910,6 +1296,7 @@ const api = {
         throw new HttpError(409, `${t.id} is already taken by ${t.assignee && t.assignee.kind === 'agent' ? 'a dashboard agent' : (t.assignee && t.assignee.name) || 'someone'}.`);
       }
       if (t.status === 'done') throw new HttpError(409, `${t.id} is already done.`);
+      if (t.kind === 'scan') throw new HttpError(409, `${t.id} is a suggestions scan run by the dashboard, not a task to pick up.`);
       t.status = 'running';
       t.outcome = null;
       t.assignee = { kind: 'session', name: who };
@@ -1029,6 +1416,7 @@ const api = {
   patchSettings(req, res, m, body) {
     if ('maxAgents' in body) db.settings.maxAgents = Math.min(16, Math.max(1, Math.round(Number(body.maxAgents)) || 1));
     if ('defaultModel' in body) db.settings.defaultModel = pick(body.defaultModel, MODELS, 'model');
+    if ('autoMax' in body) db.settings.autoMax = pick(body.autoMax, TIER_KEYS, 'level');
     if ('claudePath' in body) db.settings.claudePath = text(body.claudePath, 500).trim();
     const money = (v) => Math.min(100000, Math.max(0, Math.round((Number(v) || 0) * 100) / 100));
     if ('taskBudget' in body) db.settings.taskBudget = money(body.taskBudget);
@@ -1048,6 +1436,8 @@ const routes = [
   ['PATCH', /^\/api\/tasks\/(T\d+)$/, api.patchTask],
   ['DELETE', /^\/api\/tasks\/(T\d+)$/, api.deleteTask],
   ['POST', /^\/api\/tasks\/(T\d+)\/(run|stop|claim|note|done|fail|link|unlink)$/, api.taskAction],
+  ['POST', /^\/api\/tasks\/(T\d+)\/adopt$/, api.adopt],
+  ['POST', /^\/api\/suggest$/, api.suggest],
   ['GET', /^\/api\/projects\/(P\d+)\/conversations$/, api.listConversations],
   ['GET', /^\/api\/conversations\/([0-9a-f-]{36})$/, api.getConversation],
   ['POST', /^\/api\/projects$/, api.linkProjects],

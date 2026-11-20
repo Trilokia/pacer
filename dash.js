@@ -86,7 +86,8 @@ async function main() {
     const here = projectForCwd(state.projects);
     if (!opt.all && !here) fail('This folder is not a linked project. Use "list --all", or link the folder in the dashboard.');
     const names = Object.fromEntries(state.projects.map((p) => [p.id, p.name]));
-    const tasks = state.tasks.filter((t) => t.status !== 'done' && (opt.all || t.projectId === here.id));
+    // "What is next" scans are run by the dashboard itself; they are not tasks to pick up.
+    const tasks = state.tasks.filter((t) => t.status !== 'done' && t.kind !== 'scan' && (opt.all || t.projectId === here.id));
     console.log(opt.all ? 'Open tasks in all projects:' : `Open tasks for ${here.name}:`);
     if (!tasks.length) console.log('  (none)');
     for (const t of tasks) {

@@ -50,7 +50,45 @@ In **New task**, choose "Add several tasks at once". Write one task per line and
 
 "Add and run agents" starts them all; agents beyond the limit wait in the queue.
 
+Each task in the list can have its own setting. Add `!edit` or `!plan` to a line, or click the "Plan only" / "Edit files" label next to the task in the list under the box. Lines without one use the "Agent may (default)" box.
+
+```
+@WeatherApp Fix the crash on the settings screen !edit
+@NotesApp How should sync between devices work? !plan
+```
+
 A link like `http://localhost:4577/#T12` opens that task.
+
+### AI suggestions
+
+**AI suggestions** (top bar) asks Claude where your projects stand and what to do next. Tick the projects, choose what Claude looks at, and press **Look at projects**. One read-only agent runs per project; it changes nothing.
+
+| Look at | What Claude does |
+|---|---|
+| Notes and plan files (quick) | Reads `CLAUDE.md`, `README`, `TODO` and other `.md` files in the project and its `docs/` or `plans/` folders, and checks the code to see what is still left. About a minute per project. |
+| Notes, plans and the code (thorough) | The same, then studies the code for its own ideas: likely bugs, missing tests, release blockers. Several minutes and much more usage. |
+| The code only | Skips the notes. |
+
+If the project sits in a folder with a shared `CLAUDE.md` (for example several apps in one parent folder), the `plans/` and `docs/` folders next to it are read too.
+
+Each project comes back with a short summary and a list of suggestions, marked "Left in your notes" or "AI idea". Tick the ones you want, switch any of them between Plan only and Edit files, and press **Add to board** or **Add and run agents**. Each new task gets the model level the scan judged it needs.
+
+A scan shows on the board as a card marked **Suggestions**. Open it to read the result again, send a follow-up ("look closer at the tests"), or **Look again**. Mark it done when you have taken what you want. Tasks already on the board are not suggested again.
+
+### Which model a task uses
+
+| Choice | Model | Good for |
+|---|---|---|
+| Auto | picked per task | Lets the dashboard decide (see below) |
+| Eco | Haiku | Chores: run commands, collect information, read logs |
+| Efficient | Sonnet | Small, clearly described changes |
+| Optimized | Opus | Features across files, bugs, plans |
+| Max | Fable | Design decisions, release work, the hardest problems |
+| Default | whatever Settings says | |
+
+**Auto** first asks Haiku what kind of task it is. That takes a few seconds and costs far less than a cent. The task's activity then shows the pick and the reason, for example "Auto picked Efficient (sonnet): small one-string change". If the check does not answer, simple word rules decide. A follow-up stays on the model the first run used.
+
+In **Settings** you can make Auto the model for every task set to "Default", and set the strongest model Auto may pick (for example Optimized, so Auto never uses Fable).
 
 ### Claude conversations
 

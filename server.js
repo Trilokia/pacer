@@ -40,7 +40,7 @@ const TIERS = [
 const TIER_KEYS = TIERS.map((x) => x.key);
 // The page checks this number, so a page that is newer than the running
 // server can hide what the server cannot do yet.
-const API_VERSION = 2;
+const API_VERSION = 4;
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -263,6 +263,12 @@ function holdReason() {
     const spent = db.spend.reduce((sum, e) => sum + (e.at >= start ? e.cost : 0), 0);
     if (spent >= s.dailyBudget) return `Paused: today's spend limit is reached ($${spent.toFixed(2)} of $${s.dailyBudget.toFixed(2)})`;
   }
+  return planLimitHold();
+}
+
+// The pause for a full Claude plan limit, going by the last reading.
+function planLimitHold() {
+  const s = db.settings;
   if (s.holdPercent > 0 && db.limits) {
     for (const [key, label] of [['five_hour', '5-hour'], ['seven_day', 'weekly']]) {
       const w = db.limits.windows[key];
@@ -454,6 +460,73 @@ function linkConversation(t, id) {
   return true;
 }
 
+// ---------------------------------------------------------------- hand a task over to VS Code
+
+// The Claude extension keeps one small file here per open VS Code window,
+// naming the folder that window has open.
+const IDE_LOCKS = path.join(os.homedir(), '.claude', 'ide');
+const VSCODE = ['-a', 'Visual Studio Code'];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function vscodeHasFolder(dir) {
+  let names = [];
+  try { names = fs.readdirSync(IDE_LOCKS); } catch { return false; }
+  for (const name of names) {
+    if (!name.endsWith('.lock')) continue;
+    try {
+      const lock = JSON.parse(fs.readFileSync(path.join(IDE_LOCKS, name), 'utf8'));
+      if (lock.ideName && !/visual studio code/i.test(lock.ideName)) continue;
+      if (!(lock.workspaceFolders || []).some((f) => fs.realpathSync(f) === dir)) continue;
+      if (lock.pid) process.kill(lock.pid, 0); // throws when that VS Code is gone
+      return true;
+    } catch { /* a leftover or unreadable file */ }
+  }
+  return false;
+}
+
+// Opens the project in VS Code, then opens the Claude panel there through
+// the extension's own link. The link lands in whichever VS Code window is in
+// front, and only a window on this very folder can find the project's
+// conversations. So: open the folder, wait until its window is up, bring it
+// to the front once more, and only then send the link. Gives false when the
+// window never showed up in time (the link is still sent, as a best effort).
+async function openClaudeInVSCode(dir, query) {
+  const first = await sh('open', [...VSCODE, dir]);
+  if (!first.ok) throw new HttpError(500, 'Could not open VS Code. Is it installed in Applications?');
+  const until = Date.now() + 25000;
+  let up = vscodeHasFolder(dir);
+  while (!up && Date.now() < until) {
+    await sleep(500);
+    up = vscodeHasFolder(dir);
+  }
+  await sh('open', [...VSCODE, dir]);
+  await sleep(700);
+  const link = `vscode://anthropic.claude-code/open?${new URLSearchParams(query)}`;
+  const sent = await sh('open', [...VSCODE, link]);
+  if (!sent.ok) throw new HttpError(500, 'VS Code opened, but its Claude panel did not. Is the Claude Code extension installed?');
+  return up;
+}
+
+// What a task started by hand in VS Code begins with. It is put in the
+// message box there; you press Enter to send it.
+// The task's own text stays out of the link: Claude reads it from the board
+// by id. Link text passes through two rounds of decoding on its way into the
+// extension, and characters like & or % in a task could get mangled there.
+function handoverPrompt(t) {
+  const dash = `node "${path.join(__dirname, 'dash.js')}"`;
+  const title = t.title.replace(/[^\p{L}\p{N} .,:;!?'()/_-]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return [
+    `Pick up task ${t.id} from my project dashboard: ${title}`,
+    '',
+    `1. Read it: ${dash} show ${t.id}`,
+    `2. Take it: ${dash} claim ${t.id}`,
+    t.mode === 'plan'
+      ? '3. Do what it says. It is a plan-only task: do not change any files. Give me your findings and a step-by-step plan.'
+      : '3. Do what it says. You may edit files. Do not commit or push.',
+    `4. Finish with: ${dash} done ${t.id} "a short report in plain English: what you did, how you checked it, what is left"`,
+  ].join('\n');
+}
+
 // ---------------------------------------------------------------- notes and plan files
 
 const NOTE_DIRS = ['docs', 'doc', 'plans', 'plan', 'notes'];
@@ -591,6 +664,46 @@ async function chooseModel(t, p, bin) {
   t.auto = { tier: tier.key, model: tier.model, why, at: Date.now() };
   addLog(t, 'status', `Auto picked ${tier.label} (${tier.model}): ${why}.${tier.key !== found.tier ? ` Settings limit Auto to ${tier.label}.` : ''}`);
   changed();
+}
+
+// Reads the Claude plan limits right now with one tiny Haiku call (about a
+// hundredth of a cent; nothing when the limit is full). Agents report the
+// limits as they run, but a queue that is paused for a full limit runs no
+// agents, so by itself it would never notice a limit that was reset early.
+const LIMIT_RECHECK_MS = 5 * 60000;
+let limitCheck = null; // the check in progress, if any
+let limitCheckedAt = 0;
+function refreshLimits() {
+  if (limitCheck) return limitCheck;
+  const bin = findClaude();
+  if (!bin) return Promise.resolve(false);
+  limitCheckedAt = Date.now();
+  limitCheck = new Promise((resolve) => {
+    const args = ['-p', '--model', 'haiku', '--safe-mode', '--tools', '', '--system-prompt', 'Reply with the single word OK.',
+      '--output-format', 'stream-json', '--verbose', '--no-session-persistence'];
+    let child;
+    try {
+      child = execFile(bin, args, { cwd: os.tmpdir(), env: agentEnv(), timeout: 40000, maxBuffer: 4e6 }, (err, stdout) => {
+        let got = false;
+        for (const line of String(stdout).split('\n')) {
+          let ev;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (ev.type !== 'rate_limit_event') continue;
+          const before = db.limits;
+          recordLimits(ev);
+          if (db.limits !== before) got = true;
+        }
+        resolve(got);
+      });
+    } catch { return resolve(false); }
+    child.stdin.on('error', () => {});
+    child.stdin.end('OK');
+  }).then((got) => {
+    limitCheck = null;
+    if (got) { changed(); pump(); }
+    return got;
+  });
+  return limitCheck;
 }
 
 // ---------------------------------------------------------------- "what is next" scans
@@ -1013,6 +1126,9 @@ function pump() {
     .filter((t) => t.status === 'queued')
     .sort((a, b) => rank(b) - rank(a) || a.queuedAt - b.queuedAt);
   const hold = queued.length ? holdReason() : null;
+  // A plan limit can be reset before the time it gave. While tasks wait on
+  // one, look again every few minutes.
+  if (queued.length && planLimitHold() && Date.now() - limitCheckedAt > LIMIT_RECHECK_MS) refreshLimits();
   for (const t of queued) {
     if (hold && !t.force) { setWait(t, hold); continue; }
     if (running.size >= db.settings.maxAgents) { setWait(t, 'Waiting for a free agent slot'); continue; }
@@ -1061,6 +1177,7 @@ function newTask(f) {
 }
 
 function queueTask(t) {
+  delete t.ide;
   t.status = 'queued';
   t.queuedAt = Date.now();
   t.outcome = null;
@@ -1233,6 +1350,13 @@ const api = {
       if (to === 'todo') { t.assignee = null; t.outcome = null; delete t.force; }
       if (to === 'done') t.doneAt = Date.now();
       if (to === 'review') t.finishedAt = Date.now();
+      // Work done by hand in VS Code ends here: record what it changed.
+      if (t.ide) {
+        delete t.ide;
+        const proj = findProject(t.projectId);
+        if (to !== 'todo' && proj) saveChanges(t, proj.path).then(changed).catch(() => {});
+        if (to === 'review') t.outcome = 'ok';
+      }
       t.waitReason = null;
       delete t.pendingFollowUp;
       addLog(t, 'status', { todo: 'Moved back to To do', review: 'Moved to Needs review', done: 'Marked done' }[to]);
@@ -1318,6 +1442,8 @@ const api = {
         addLog(t, 'note', msg);
       } else {
         if (!t.assignee) t.assignee = { kind: 'session', name: who };
+        const byHand = Boolean(t.ide); // continued in VS Code: record changes whatever the mode
+        delete t.ide;
         t.status = 'review';
         t.outcome = action === 'done' ? 'ok' : 'failed';
         t.finishedAt = Date.now();
@@ -1325,7 +1451,7 @@ const api = {
         addLog(t, action === 'done' ? 'status' : 'error', action === 'done' ? 'Reported as finished. Waiting for your review.' : 'Reported as not finished.');
         infoCache.delete(t.projectId);
         const proj = findProject(t.projectId);
-        if (t.mode === 'edit' && proj) saveChanges(t, proj.path).then(changed).catch(() => {});
+        if ((t.mode === 'edit' || byHand) && proj) saveChanges(t, proj.path).then(changed).catch(() => {});
       }
       changed();
     }
@@ -1413,6 +1539,57 @@ const api = {
     return { root, found };
   },
 
+  // "Continue in VS Code" and "Start in VS Code" on a task.
+  async openInVSCode(req, res, m, body) {
+    const t = findTask(m[1]);
+    if (!t) throw new HttpError(404, 'That task no longer exists.');
+    const p = findProject(t.projectId);
+    if (!p || !fs.existsSync(p.path)) throw new HttpError(409, 'The project folder was not found. Check the project link.');
+    if (t.kind === 'scan') throw new HttpError(409, 'A suggestions scan is run by the dashboard, not in VS Code.');
+    if (agentBusy(t)) throw new HttpError(409, 'Stop the agent first.');
+    const mine = t.status === 'running' && t.ide;
+
+    if (body.how === 'continue') {
+      // The agent's own conversation, else the newest one linked to the task.
+      const saved = (id) => fs.existsSync(path.join(sessionDir(p.path), `${id}.jsonl`));
+      const sid = [t.sessionId, ...(t.conversations || []).slice().reverse()].find((id) => id && saved(id));
+      if (!sid) throw new HttpError(409, 'This task has no conversation saved on this Mac any more. Use "Start in VS Code" instead.');
+      const up = await openClaudeInVSCode(p.path, { session: sid });
+      if (!mine && !agentBusy(t)) {
+        // While you work on it by hand, the dashboard must not run its own
+        // agent on the same conversation. Showing it as yours sees to that.
+        t.status = 'running';
+        t.outcome = null;
+        t.assignee = { kind: 'session', name: 'You, in VS Code' };
+        t.ide = { at: Date.now(), sessionId: sid };
+        t.startedAt = Date.now();
+        t.finishedAt = null;
+        t.waitReason = null;
+        addLog(t, 'status', 'Continued by you in VS Code');
+        // Remember how the files look now, so the task can show what changed.
+        if (!t.baseTree) snapshotTree(p.path).then((tree) => { t.baseTree = tree; save(); }).catch(() => {});
+        changed();
+      }
+      return { ok: true, sure: up, message: up
+        ? 'Opened this conversation in VS Code. If VS Code asks whether to open the link, press Open. The task stays In progress until you press "Finished in VS Code".'
+        : 'VS Code is slow to open this folder. If no Claude chat showed up, answer any question VS Code asks about trusting the folder, then press the button again.' };
+    }
+
+    const up = await openClaudeInVSCode(p.path, { prompt: handoverPrompt(t) });
+    addLog(t, 'status', 'Opened in VS Code to start by hand');
+    changed();
+    return { ok: true, sure: up, message: up
+      ? 'VS Code is open with the task in the Claude message box: press Enter there to start it. If VS Code asks whether to open the link, press Open.'
+      : 'VS Code is slow to open this folder. If no Claude chat showed up, answer any question VS Code asks about trusting the folder, then press the button again.' };
+  },
+
+  // "Check now" in the Usage dialog.
+  async checkLimits() {
+    const got = await refreshLimits();
+    if (!got) throw new HttpError(502, 'Could not read your plan limits just now. Try again in a minute.');
+    return usage();
+  },
+
   patchSettings(req, res, m, body) {
     if ('maxAgents' in body) db.settings.maxAgents = Math.min(16, Math.max(1, Math.round(Number(body.maxAgents)) || 1));
     if ('defaultModel' in body) db.settings.defaultModel = pick(body.defaultModel, MODELS, 'model');
@@ -1437,7 +1614,9 @@ const routes = [
   ['DELETE', /^\/api\/tasks\/(T\d+)$/, api.deleteTask],
   ['POST', /^\/api\/tasks\/(T\d+)\/(run|stop|claim|note|done|fail|link|unlink)$/, api.taskAction],
   ['POST', /^\/api\/tasks\/(T\d+)\/adopt$/, api.adopt],
+  ['POST', /^\/api\/tasks\/(T\d+)\/vscode$/, api.openInVSCode],
   ['POST', /^\/api\/suggest$/, api.suggest],
+  ['POST', /^\/api\/limits\/check$/, api.checkLimits],
   ['GET', /^\/api\/projects\/(P\d+)\/conversations$/, api.listConversations],
   ['GET', /^\/api\/conversations\/([0-9a-f-]{36})$/, api.getConversation],
   ['POST', /^\/api\/projects$/, api.linkProjects],

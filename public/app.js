@@ -170,7 +170,9 @@ const TIERS = [['eco', 'Eco', 'haiku'], ['efficient', 'Efficient', 'sonnet'], ['
 const MODEL_NAME = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus', fable: 'Fable' };
 // False while the page is newer than the running server (it was updated but
 // not restarted yet): the new features stay hidden until the restart.
-const v2 = () => (S.meta.version || 1) >= 2;
+const PAGE_VERSION = 4;
+const serverHas = (n) => (S.meta.version || 1) >= n;
+const v2 = () => serverHas(2);
 
 function modelLabel(v) {
   if (v === 'auto') return 'Auto';
@@ -235,9 +237,9 @@ function render() {
     banner.hidden = false;
   } else if (banner.dataset.offline) {
     // keep the "lost contact" message
-  } else if (ui.loaded && !v2()) {
+  } else if (ui.loaded && !serverHas(PAGE_VERSION)) {
     banner.className = 'banner';
-    banner.textContent = 'The dashboard was updated. Restart it (close its Terminal window, then open start.command again) to get AI suggestions and the automatic model choice. A restart stops running agents, so let them finish first.';
+    banner.textContent = 'The dashboard was updated. Restart it (close its Terminal window, then open start.command again) to get the newest features. A restart stops running agents and moves waiting tasks back to To do, so let them finish first.';
     banner.hidden = false;
   } else {
     banner.hidden = true;
@@ -423,6 +425,21 @@ async function act(id, action, body) {
   refreshSoon();
 }
 const runTask = (id, body) => act(id, 'run', body);
+// Hands a task to the Claude panel in VS Code: the same conversation
+// ("continue"), or a new one with the task ready to send ("start").
+async function openInVSCode(id, how, button) {
+  if (document.activeElement) document.activeElement.blur(); // lets the buttons redraw
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Opening VS Code…';
+  try {
+    const r = await api('POST', `/api/tasks/${id}/vscode`, { how });
+    toast(r.message);
+  } catch { /* the error is already shown */ }
+  button.disabled = false;
+  button.textContent = label;
+  refreshSoon();
+}
 async function patchTask(id, body) {
   await api('PATCH', `/api/tasks/${id}`, body);
   refreshSoon();
@@ -533,23 +550,34 @@ function renderDrawer() {
         ? `Auto picked ${modelLabel(t.auto.model)} for the last run: ${t.auto.why}.`
         : 'Auto: when the agent starts, a quick check of the task type picks the model (Eco, Efficient, Optimized or Max).')));
 
-  part('#d-actions', [t.status, t.outcome, t.mode, Boolean(t.sessionId), isAgent(t), /^Paused/.test(t.waitReason || '')].join('|'), () => {
+  // A task with a saved conversation can be continued in VS Code; one without can be started there.
+  const hasConvo = (t.conversationInfo || []).some((c) => !c.missing);
+  part('#d-actions', [t.status, t.outcome, t.mode, Boolean(t.sessionId), isAgent(t), /^Paused/.test(t.waitReason || ''), hasConvo, Boolean(t.ide), S.meta.version].join('|'), () => {
     const b = [];
     const btn = (label, fn, cls = '') => h('button', { class: `btn ${cls}`, onclick: fn }, label);
+    const vscode = (label) => {
+      if (!serverHas(4) || scan) return null;
+      const el = btn(label || (hasConvo ? 'Continue in VS Code' : 'Start in VS Code'), () => openInVSCode(id, hasConvo ? 'continue' : 'start', el));
+      el.title = hasConvo
+        ? 'Opens this task\'s conversation in the Claude panel of VS Code, with everything said so far.'
+        : 'Opens VS Code with this task ready in the Claude message box, so you can run it by hand.';
+      return el;
+    };
     if (t.status === 'todo') {
-      b.push(btn('Run agent', () => runTask(id), 'primary'), btn('Mark done', () => patchTask(id, { status: 'done' })));
+      b.push(btn('Run agent', () => runTask(id), 'primary'), vscode(), btn('Mark done', () => patchTask(id, { status: 'done' })));
     } else if (t.status === 'queued') {
       b.push(btn('Cancel', () => act(id, 'stop')));
       if (/^Paused/.test(t.waitReason || '')) b.push(btn('Run anyway', () => runTask(id, { force: true })));
     } else if (t.status === 'running') {
       if (isAgent(t)) b.push(btn('Stop agent', () => act(id, 'stop'), 'danger'));
+      else if (t.ide) b.push(btn('Finished in VS Code', () => patchTask(id, { status: 'review' }), 'primary'), hasConvo && vscode('Open it in VS Code again'), btn('Mark done', () => patchTask(id, { status: 'done' })), btn('Take it back (To do)', () => patchTask(id, { status: 'todo' })));
       else b.push(btn('Mark done', () => patchTask(id, { status: 'done' })), btn('Take it back (To do)', () => patchTask(id, { status: 'todo' })));
     } else if (t.status === 'review') {
       b.push(btn('Mark done', () => patchTask(id, { status: 'done' }), 'primary'));
       if (t.mode === 'plan' && t.outcome === 'ok' && t.sessionId && !scan) {
         b.push(btn('Carry out this plan', () => runTask(id, { mode: 'edit', message: 'I have read your plan. Go ahead and carry it out now. You may edit files. Do not commit.' })));
       }
-      b.push(btn(scan ? 'Look again' : 'Run again from scratch', () => runTask(id)), btn('Back to To do', () => patchTask(id, { status: 'todo' })));
+      b.push(vscode(), btn(scan ? 'Look again' : 'Run again from scratch', () => runTask(id)), btn('Back to To do', () => patchTask(id, { status: 'todo' })));
     } else {
       b.push(btn('Reopen', () => patchTask(id, { status: 'todo' })));
     }
@@ -1377,6 +1405,17 @@ function usageDialog() {
   const daily = h('input', { type: 'number', min: 0, step: 1, value: s.dailyBudget > 0 ? String(s.dailyBudget) : '', placeholder: 'No limit' });
   const perRun = h('input', { type: 'number', min: 0, step: 0.5, value: s.taskBudget > 0 ? String(s.taskBudget) : '', placeholder: 'No limit' });
   const hold = h('input', { type: 'number', min: 0, max: 100, step: 5, value: s.holdPercent > 0 ? String(s.holdPercent) : '', placeholder: 'Never' });
+  // Reads the limits afresh, for when you know they changed (a reset, say).
+  const check = serverHas(3) && h('button', { class: 'link', onclick: async () => {
+    check.disabled = true;
+    check.textContent = 'Checking…';
+    try {
+      await api('POST', '/api/limits/check');
+      await refresh();
+      usageDialog();
+      toast(S.usage.hold ? 'Checked: still paused.' : 'Checked. Your limits are up to date.');
+    } catch { check.disabled = false; check.textContent = 'Check now'; }
+  } }, 'Check now');
 
   showDialog('Usage and budgets', [
     u.hold && h('div', { class: 'banner bad', style: 'border-radius:8px; border:0' }, u.hold),
@@ -1387,8 +1426,8 @@ function usageDialog() {
     h('div', null,
       h('div', { class: 'sect-title' }, 'Your Claude plan limits'),
       limits.length
-        ? [h('div', { class: 'limits' }, limits), h('p', { class: 'hint', style: 'margin-top:8px' }, `As of ${ago(u.limits.at)}. This updates each time a dashboard agent runs. Your own Claude sessions use the same limits, so the real number can be higher.`)]
-        : h('p', { class: 'hint' }, 'Shown after the first agent run.')),
+        ? [h('div', { class: 'limits' }, limits), h('p', { class: 'hint', style: 'margin-top:8px' }, `As of ${ago(u.limits.at)}. This updates each time a dashboard agent runs, and every few minutes while tasks are paused by a limit. Your own Claude sessions use the same limits, so the real number can differ. `, check)]
+        : h('p', { class: 'hint' }, 'Shown after the first agent run. ', check)),
     h('div', null, h('div', { class: 'sect-title' }, 'Spend per day, last 14 days'), spendChart(u.days)),
     rows.length ? h('div', null,
       h('div', { class: 'sect-title' }, 'By project'),

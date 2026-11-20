@@ -38,6 +38,19 @@ Each task has a setting for what an agent may do:
 - **Carry out this plan**, which turns a plan-only task into an editing run.
 - Continue the agent yourself in a terminal with the `claude --resume …` line shown at the bottom of the task.
 
+### Working on a task yourself in VS Code
+
+A task's details have a button that moves it into the Claude panel of VS Code, for when you want to steer it by hand:
+
+- **Continue in VS Code** (a task that already has a conversation): opens the project in VS Code and that same conversation in the Claude panel, with everything said so far. The task shows **In progress** as yours, so the dashboard does not run its own agent on it at the same time. When you are done, press **Finished in VS Code**: the task goes to Needs review and its Changes section shows what changed while you worked. After that, "Send a follow-up" works again and the agent knows what you did in VS Code.
+- **Start in VS Code** (a task that has not run yet): opens VS Code with a short message ready in the Claude box. Press Enter there. Claude reads the task from the board, takes it, and reports back when it finishes, and the conversation is linked to the task.
+
+Good to know:
+
+- The first time, VS Code asks whether the Claude Code extension may open the link. Tick "Do not ask me again" and press Open.
+- A folder VS Code has never opened asks whether you trust it. Until you answer, the Claude panel cannot open there. Answer, then press the button again.
+- The project opens in its own VS Code window. A conversation can only be opened from a window on that same folder.
+
 ### Several tasks at once
 
 In **New task**, choose "Add several tasks at once". Write one task per line and tag its project with `@Name` (click a tag button to insert it, or type the start of the name, like `@wea`). Tag two or more projects on one line to give the same task to each. Indent a line to add details to the task above it:
@@ -114,7 +127,7 @@ The strip at the top shows today's spend and how full your Claude plan limits ar
 - **Spend limit for one agent run:** a run that reaches it stops and lands in Needs review. Each task can have its own limit.
 - **Plan-limit pause:** new agents wait when your 5-hour or weekly Claude limit is this full (90% by default), so background work does not use up what you need yourself.
 
-Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts are what the runs would cost at API prices; on a Claude subscription you are not billed them. The plan-limit numbers update only when a dashboard agent runs.
+Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts are what the runs would cost at API prices; on a Claude subscription you are not billed them. The plan-limit numbers update each time a dashboard agent runs. While tasks are paused by a full limit, the dashboard reads the limit again every 5 minutes, so a limit that was reset early is noticed and the queue starts again. **Check now** in the Usage dialog reads it right away.
 
 ### Limits that keep things safe
 

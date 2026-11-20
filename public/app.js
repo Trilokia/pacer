@@ -170,9 +170,22 @@ const TIERS = [['eco', 'Eco', 'haiku'], ['efficient', 'Efficient', 'sonnet'], ['
 const MODEL_NAME = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus', fable: 'Fable' };
 // False while the page is newer than the running server (it was updated but
 // not restarted yet): the new features stay hidden until the restart.
-const PAGE_VERSION = 4;
+const PAGE_VERSION = 5;
 const serverHas = (n) => (S.meta.version || 1) >= n;
 const v2 = () => serverHas(2);
+
+// How careful agents are with your Claude limit.
+const USAGE_MODES = [
+  ['saver', 'Saver', 'Uses the least: Auto picks the model for every task set to Default, nothing runs above Optimized (Opus), small models think less, a run stops at its spend limit, and the biggest tasks plan first and edit only after your OK.'],
+  ['balanced', 'Balanced', 'Auto picks the model for every task set to Default. Nothing else is held back.'],
+  ['full', 'Full power', 'Tasks set to Default use Claude Code\'s own model, and agents start by count alone.'],
+];
+const usageMode = () => (serverHas(5) && S.settings.usageMode) || 'full';
+// What "Default" means for a task right now.
+const defaultModel = () => S.settings.defaultModel || (usageMode() === 'full' ? '' : 'auto');
+// A waiting task that "Run anyway" can push through.
+const canForce = (t) => /^(Paused|Waiting for room|Waiting for your Claude)/.test(t.waitReason || '');
+const plansFirst = (t) => t.phase === 'plan';
 
 function modelLabel(v) {
   if (v === 'auto') return 'Auto';
@@ -181,8 +194,8 @@ function modelLabel(v) {
 }
 // The choices for a model box.
 function modelOptions(forSettings) {
-  const def = S.settings.defaultModel;
-  const first = forSettings ? "Claude Code's own default" : def ? `Default (${modelLabel(def)})` : 'Default';
+  const def = defaultModel();
+  const first = forSettings ? (usageMode() === 'full' ? "Claude Code's own default" : 'Auto (set by the usage mode)') : def ? `Default (${modelLabel(def)})` : 'Default';
   return [['', first], v2() && ['auto', 'Auto (by task type)'], ...TIERS.map((x) => [x[2], modelLabel(x[2])])].filter(Boolean);
 }
 // The level a suggestion will really run at: never above the limit in Settings.
@@ -214,10 +227,105 @@ function refreshSoon() {
 }
 
 function setFilter(id, silent) {
+  if (!silent && id !== 'all' && id !== ui.filter) noteOpened(id);
   ui.filter = id;
   ui.allDone = false;
   localStorage.setItem('dash.filter', id);
   if (!silent) render();
+}
+
+// ---------------------------------------------------------------- project order
+
+// How the project list is sorted. The choice, your own drag order and when you
+// last opened each project are kept in this browser only.
+const PROJECT_SORTS = [
+  ['priority', 'Priority (auto)'],
+  ['recent', 'Recently opened'],
+  ['least', 'Least recently opened'],
+  ['most', 'Most opened'],
+  ['name', 'A to Z'],
+  ['custom', 'Custom (drag to arrange)'],
+];
+function readJSON(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; }
+}
+function writeJSON(key, v) {
+  try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* storage full or blocked */ }
+}
+function projSort() {
+  const v = localStorage.getItem('dash.sort');
+  return PROJECT_SORTS.some(([k]) => k === v) ? v : 'priority';
+}
+function setProjSort(v) {
+  // Starting Custom with no saved order keeps the order you see now.
+  if (v === 'custom' && !readJSON('dash.order', []).length && ui.shownOrder) writeJSON('dash.order', ui.shownOrder);
+  localStorage.setItem('dash.sort', v);
+  $('#proj-sort').value = v;
+  renderProjects();
+}
+// "Opened" = picked in the side list, or opened in Finder / VS Code.
+function noteOpened(pid) {
+  const all = readJSON('dash.opened', {});
+  all[pid] = { at: Date.now(), n: ((all[pid] && all[pid].n) || 0) + 1 };
+  writeJSON('dash.opened', all);
+}
+
+// What makes a project need you now, for the Priority sort.
+function urgency(p) {
+  const mine = S.tasks.filter((t) => t.projectId === p.id && t.status !== 'done' && t.kind !== 'scan');
+  const days = p.deadline ? Math.ceil((new Date(p.deadline + 'T00:00') - Date.now()) / 86400000) : null;
+  return {
+    days,
+    // A deadline in the next two weeks counts. One missed by more than two
+    // weeks is probably stale, so it no longer pins the project to the top.
+    soon: days !== null && days >= -14 && days <= 14 ? days : Infinity,
+    high: mine.filter((t) => t.priority === 'high').length,
+    review: mine.filter((t) => t.status === 'review').length,
+    open: mine.length,
+  };
+}
+
+function sortedProjects(mode = projSort()) {
+  const status = { active: 0, paused: 1, shipped: 2 };
+  const opened = readJSON('dash.opened', {});
+  const at = (p) => (opened[p.id] && opened[p.id].at) || 0;
+  const n = (p) => (opened[p.id] && opened[p.id].n) || 0;
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  const list = [...S.projects];
+  if (mode === 'custom') {
+    const order = readJSON('dash.order', []);
+    const pos = (p) => { const i = order.indexOf(p.id); return i < 0 ? Infinity : i; };
+    // Projects linked after you arranged the list go at the end.
+    return list.sort((a, b) => pos(a) - pos(b) || status[a.status] - status[b.status] || byName(a, b));
+  }
+  let cmp = byName;
+  if (mode === 'recent') cmp = (a, b) => at(b) - at(a) || byName(a, b);
+  if (mode === 'least') cmp = (a, b) => at(a) - at(b) || byName(a, b);
+  if (mode === 'most') cmp = (a, b) => n(b) - n(a) || at(b) - at(a) || byName(a, b);
+  if (mode === 'priority') {
+    const u = new Map(list.map((p) => [p.id, urgency(p)]));
+    cmp = (a, b) => {
+      const x = u.get(a.id), y = u.get(b.id);
+      return (x.soon - y.soon || 0) || y.high - x.high || y.review - x.review || y.open - x.open || at(b) - at(a) || byName(a, b);
+    };
+  }
+  // Paused and shipped projects stay below the active ones.
+  return list.sort((a, b) => status[a.status] - status[b.status] || cmp(a, b));
+}
+
+function clearDropMarks() {
+  for (const el of document.querySelectorAll('.proj.drop-before, .proj.drop-after')) el.classList.remove('drop-before', 'drop-after');
+}
+
+// Moves a project in the custom order (and switches to Custom).
+function moveProject(pid, beforeId) {
+  const order = (ui.shownOrder || S.projects.map((p) => p.id)).filter((id) => id !== pid);
+  const i = beforeId ? order.indexOf(beforeId) : -1;
+  order.splice(i < 0 ? order.length : i, 0, pid);
+  writeJSON('dash.order', order);
+  if (projSort() !== 'custom') toast('Switched to Custom order. Pick another sort any time.');
+  ui.holdOrder = false;
+  setProjSort('custom');
 }
 
 // ---------------------------------------------------------------- render: page
@@ -245,6 +353,9 @@ function render() {
     banner.hidden = true;
   }
   $('#btn-suggest').hidden = !v2() || !S.projects.length;
+  const pick = $('#usage-mode');
+  pick.hidden = !serverHas(5);
+  if (document.activeElement !== pick) pick.value = usageMode();
 
   renderUsageStrip();
   renderProjects();
@@ -275,16 +386,31 @@ function renderProjects() {
       h('span', { class: 'proj-name' }, 'All projects'),
       h('span', { class: 'proj-right' }, h('span', { class: 'count' }, open().length))),
   ];
-  const order = { active: 0, paused: 1, shipped: 2 };
-  const sorted = [...S.projects].sort((a, b) => order[a.status] - order[b.status] || a.name.localeCompare(b.name));
+  const mode = projSort();
+  let sorted = sortedProjects(mode);
+  // While the pointer is on the list, keep rows where they are so the one you
+  // just clicked does not jump away. The new order shows when you leave.
+  if (ui.holdOrder && ui.shownOrder) {
+    const pos = (p) => { const i = ui.shownOrder.indexOf(p.id); return i < 0 ? Infinity : i; };
+    sorted = [...S.projects].sort((a, b) => pos(a) - pos(b));
+  }
+  ui.shownOrder = sorted.map((p) => p.id);
+  if ($('#proj-sort').value !== mode) $('#proj-sort').value = mode;
+  $('#proj-tip').hidden = mode !== 'custom';
   for (const p of sorted) {
     const mine = open(p);
     const busy = mine.some((t) => t.status === 'running');
     const info = p.info || {};
+    const urg = urgency(p);
     const sub = [];
     if (!info.exists) sub.push(h('span', { class: 'warn' }, 'Folder missing'));
     else {
       if (p.status !== 'active') sub.push(p.status === 'paused' ? 'Paused' : 'Shipped');
+      if (p.status === 'active' && urg.soon !== Infinity) {
+        sub.push(h('span', { class: urg.days < 0 ? 'warn' : 'dirty' },
+          urg.days < 0 ? `Deadline passed ${plural(-urg.days, 'day')} ago` : urg.days === 0 ? 'Due today' : `Due in ${plural(urg.days, 'day')}`));
+      }
+      if (urg.high) sub.push(h('span', { class: 'dirty' }, `${urg.high} high`));
       sub.push(info.type);
       if (info.git) {
         sub.push(info.git.branch);
@@ -294,9 +420,43 @@ function renderProjects() {
     }
     rows.push(h('div', {
       class: `proj${ui.filter === p.id ? ' on' : ''}${p.status !== 'active' ? ' dim' : ''}`,
-      role: 'button', tabIndex: 0, title: p.path,
+      role: 'button', tabIndex: 0, title: `${p.path}\nDrag to arrange, or Alt+Up / Alt+Down`,
+      draggable: true, dataset: { pid: p.id },
       onclick: () => setFilter(p.id),
-      onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) setFilter(p.id); },
+      onkeydown: (e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === 'Enter') setFilter(p.id);
+        if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+          e.preventDefault();
+          const ids = ui.shownOrder;
+          const i = ids.indexOf(p.id);
+          const j = e.key === 'ArrowUp' ? i - 1 : i + 2;
+          if (j < 0 || i + (e.key === 'ArrowUp' ? -1 : 1) >= ids.length) return;
+          moveProject(p.id, ids[j]);
+          const el = $(`.proj[data-pid="${p.id}"]`);
+          if (el) el.focus();
+        }
+      },
+      ondragstart: (e) => { ui.drag = p.id; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', p.name); e.currentTarget.classList.add('dragging'); },
+      ondragend: (e) => { ui.drag = null; e.currentTarget.classList.remove('dragging'); clearDropMarks(); },
+      ondragover: (e) => {
+        if (!ui.drag || ui.drag === p.id) return;
+        e.preventDefault();
+        const r = e.currentTarget.getBoundingClientRect();
+        const after = e.clientY > r.top + r.height / 2;
+        clearDropMarks();
+        e.currentTarget.classList.add(after ? 'drop-after' : 'drop-before');
+      },
+      ondrop: (e) => {
+        if (!ui.drag || ui.drag === p.id) return;
+        e.preventDefault();
+        const after = e.currentTarget.classList.contains('drop-after');
+        const ids = ui.shownOrder.filter((id) => id !== ui.drag);
+        const before = after ? ids[ids.indexOf(p.id) + 1] : p.id;
+        const id = ui.drag;
+        ui.drag = null;
+        moveProject(id, before);
+      },
     },
     h('span', { class: 'proj-name' }, p.name),
     h('span', { class: 'proj-right' },
@@ -380,7 +540,7 @@ function card(t) {
     line = h('div', { class: 'card-line' }, h('span', { class: 'what', title: t.waitReason || '' }, t.waitReason || 'Queued'));
     actions = [
       h('button', { class: 'btn small', onclick: stop(() => act(t.id, 'stop')) }, 'Cancel'),
-      /^Paused/.test(t.waitReason || '') && h('button', { class: 'btn small', onclick: stop(() => runTask(t.id, { force: true })) }, 'Run anyway'),
+      canForce(t) && h('button', { class: 'btn small', onclick: stop(() => runTask(t.id, { force: true })) }, 'Run anyway'),
     ];
   } else if (t.status === 'running') {
     line = h('div', { class: 'card-line' },
@@ -389,7 +549,7 @@ function card(t) {
       h('span', { class: 'timer', dataset: { since: t.startedAt } }, dur(Date.now() - t.startedAt)));
     if (isAgent(t)) actions = h('button', { class: 'btn small', onclick: stop(() => act(t.id, 'stop')) }, 'Stop');
   } else if (t.status === 'review') {
-    const label = { ok: 'Finished', failed: 'Did not finish', stopped: 'Stopped' }[t.outcome] || 'Waiting for you';
+    const label = (plansFirst(t) && t.outcome === 'ok' ? 'Plan ready: needs your OK' : { ok: 'Finished', failed: 'Did not finish', stopped: 'Stopped' }[t.outcome]) || 'Waiting for you';
     const found = t.kind === 'scan' && t.outcome === 'ok' && t.suggestions ? plural(t.suggestions.length, 'suggestion') : null;
     line = h('div', { class: `card-line ${t.outcome === 'failed' ? 'failed' : 'review'}` },
       h('span', { class: 'what' }, [found || label, ago(t.finishedAt), t.changes && t.changes.files ? plural(t.changes.files, 'file') + ' changed' : null].filter(Boolean).join(' · ')));
@@ -407,7 +567,7 @@ function card(t) {
     t.priority === 'high' && h('span', { class: 'chip high' }, 'High'),
     t.kind === 'scan'
       ? h('span', { class: 'chip right scan' }, 'Suggestions')
-      : h('span', { class: `chip right ${t.mode}` }, t.mode === 'edit' ? 'Edit files' : 'Plan only')),
+      : h('span', { class: `chip right ${plansFirst(t) ? 'plan' : t.mode}` }, plansFirst(t) ? 'Plan first' : t.mode === 'edit' ? 'Edit files' : 'Plan only')),
   h('h3', null, t.title),
   h('div', { class: 'card-meta' }, [ui.filter === 'all' && p ? p.name : null, whoText(t)].filter(Boolean).join(' · ')),
   line,
@@ -532,8 +692,8 @@ function renderDrawer() {
   ]);
 
   const scan = t.kind === 'scan';
-  const usesAuto = (t.model || S.settings.defaultModel) === 'auto';
-  part('#d-fields', [t.title, t.description, t.projectId, t.mode, t.model, t.priority, t.budget, S.settings.taskBudget, S.settings.defaultModel, S.meta.version, t.auto && t.auto.at, lock, S.projects.map((p) => p.id + p.name).join()].join('\u0001'), () =>
+  const usesAuto = (t.model || defaultModel()) === 'auto';
+  part('#d-fields', [t.title, t.description, t.projectId, t.mode, t.model, t.priority, t.budget, S.settings.taskBudget, defaultModel(), usageMode(), S.meta.version, t.auto && t.auto.at, t.phase, t.status, lock, S.projects.map((p) => p.id + p.name).join()].join('\u0001'), () =>
     h('div', { class: 'stack' },
       h('input', { type: 'text', class: 'd-title', value: t.title, 'aria-label': 'Title', onchange: (e) => patchTask(id, { title: e.target.value }) }),
       scan
@@ -547,12 +707,15 @@ function renderDrawer() {
         field('Spend limit for one run ($)', budgetInput(t.budget, (v) => patchTask(id, { budget: v }), lock))),
       scan && h('p', { class: 'hint' }, `${projectOf(t) ? projectOf(t).name : 'Project'}: Claude looks at ${t.scan && t.scan.code ? (t.scan.notes ? 'the notes, the plans and the code' : 'the code') : 'the notes and plan files'} and changes nothing.`),
       usesAuto && h('p', { class: 'hint' }, t.auto
-        ? `Auto picked ${modelLabel(t.auto.model)} for the last run: ${t.auto.why}.`
-        : 'Auto: when the agent starts, a quick check of the task type picks the model (Eco, Efficient, Optimized or Max).')));
+        ? `Auto picked ${modelLabel(t.auto.model)}: ${t.auto.why}.`
+        : 'Auto: when the agent starts, a quick check of the task type picks the model (Eco, Efficient, Optimized or Max).'),
+      plansFirst(t) && h('p', { class: 'hint' }, t.status === 'review'
+        ? 'Usage saver: this is a big task, so the agent only planned. Read the plan, then press "Carry out this plan" to let it edit files.'
+        : 'Usage saver: this is a big task, so the agent plans first and edits files only after your OK.')));
 
   // A task with a saved conversation can be continued in VS Code; one without can be started there.
   const hasConvo = (t.conversationInfo || []).some((c) => !c.missing);
-  part('#d-actions', [t.status, t.outcome, t.mode, Boolean(t.sessionId), isAgent(t), /^Paused/.test(t.waitReason || ''), hasConvo, Boolean(t.ide), S.meta.version].join('|'), () => {
+  part('#d-actions', [t.status, t.outcome, t.mode, t.phase, Boolean(t.sessionId), isAgent(t), canForce(t), hasConvo, Boolean(t.ide), S.meta.version].join('|'), () => {
     const b = [];
     const btn = (label, fn, cls = '') => h('button', { class: `btn ${cls}`, onclick: fn }, label);
     const vscode = (label) => {
@@ -567,15 +730,17 @@ function renderDrawer() {
       b.push(btn('Run agent', () => runTask(id), 'primary'), vscode(), btn('Mark done', () => patchTask(id, { status: 'done' })));
     } else if (t.status === 'queued') {
       b.push(btn('Cancel', () => act(id, 'stop')));
-      if (/^Paused/.test(t.waitReason || '')) b.push(btn('Run anyway', () => runTask(id, { force: true })));
+      if (canForce(t)) b.push(btn('Run anyway', () => runTask(id, { force: true })));
     } else if (t.status === 'running') {
       if (isAgent(t)) b.push(btn('Stop agent', () => act(id, 'stop'), 'danger'));
       else if (t.ide) b.push(btn('Finished in VS Code', () => patchTask(id, { status: 'review' }), 'primary'), hasConvo && vscode('Open it in VS Code again'), btn('Mark done', () => patchTask(id, { status: 'done' })), btn('Take it back (To do)', () => patchTask(id, { status: 'todo' })));
       else b.push(btn('Mark done', () => patchTask(id, { status: 'done' })), btn('Take it back (To do)', () => patchTask(id, { status: 'todo' })));
     } else if (t.status === 'review') {
-      b.push(btn('Mark done', () => patchTask(id, { status: 'done' }), 'primary'));
-      if (t.mode === 'plan' && t.outcome === 'ok' && t.sessionId && !scan) {
-        b.push(btn('Carry out this plan', () => runTask(id, { mode: 'edit', message: 'I have read your plan. Go ahead and carry it out now. You may edit files. Do not commit.' })));
+      const planned = (t.mode === 'plan' || plansFirst(t)) && t.outcome === 'ok' && t.sessionId && !scan;
+      // A task that planned first is waiting for your OK, so that is the main button.
+      b.push(btn('Mark done', () => patchTask(id, { status: 'done' }), planned && plansFirst(t) ? '' : 'primary'));
+      if (planned) {
+        b.push(btn('Carry out this plan', () => runTask(id, { mode: 'edit', message: 'I have read your plan. Go ahead and carry it out now. You may edit files. Do not commit.' }), plansFirst(t) ? 'primary' : ''));
       }
       b.push(vscode(), btn(scan ? 'Look again' : 'Run again from scratch', () => runTask(id)), btn('Back to To do', () => patchTask(id, { status: 'todo' })));
     } else {
@@ -592,7 +757,7 @@ function renderDrawer() {
   });
 
   const canFollow = t.status === 'review' && Boolean(t.sessionId);
-  part('#d-follow', canFollow, () => {
+  part('#d-follow', [canFollow, t.mode, t.phase].join('|'), () => {
     if (!canFollow) return null;
     const box = h('textarea', { rows: 3, placeholder: 'Ask the same agent for a change or a fix. It remembers what it did.', 'aria-label': 'Follow-up for the agent' });
     return h('div', { class: 'follow' },
@@ -600,7 +765,7 @@ function renderDrawer() {
       box,
       h('div', { class: 'btns' },
         h('button', { class: 'btn', onclick: () => { const v = box.value.trim(); if (!v) return toast('Write the follow-up first.'); box.blur(); runTask(id, { message: v }); } }, 'Send to agent'),
-        h('span', { class: 'hint' }, t.mode === 'edit' ? 'The agent may edit files.' : 'Plan only: the agent will not change files.')));
+        h('span', { class: 'hint' }, t.mode === 'edit' && !plansFirst(t) ? 'The agent may edit files.' : 'Plan only: the agent will not change files.')));
   });
 
   if (scan && Array.isArray(t.suggestions)) {
@@ -618,8 +783,8 @@ function renderDrawer() {
       ];
     });
   } else {
-    part('#d-report', [t.report, t.outcome].join('\u0001'), () => t.report && [
-      h('div', { class: 'sect-title' }, scan ? 'Report' : t.mode === 'plan' ? 'Plan and findings' : 'Report'),
+    part('#d-report', [t.report, t.outcome, t.phase].join('\u0001'), () => t.report && [
+      h('div', { class: 'sect-title' }, scan ? 'Report' : t.mode === 'plan' || plansFirst(t) ? 'Plan and findings' : 'Report'),
       h('div', { class: `report${t.outcome === 'failed' ? ' failed' : ''}` }, md(t.report)),
     ]);
   }
@@ -761,8 +926,7 @@ function adoptButtons(getScans) {
 
 function suggestDialog() {
   if (!S.projects.length) return linkDialog();
-  const order = { active: 0, paused: 1, shipped: 2 };
-  const projects = [...S.projects].sort((x, y) => order[x.status] - order[y.status] || x.name.localeCompare(y.name));
+  const projects = sortedProjects();
   // A project keeps one open scan; a scan you marked done no longer shows here.
   const scanOf = (pid) => S.tasks.filter((t) => t.kind === 'scan' && t.projectId === pid && t.status !== 'done').sort((a, b) => b.createdAt - a.createdAt)[0];
   const scans = () => projects.map((p) => scanOf(p.id)).filter(Boolean);
@@ -937,11 +1101,11 @@ function agentLimit(onchange) {
 
 function newTaskDialog() {
   if (!S.projects.length) return linkDialog();
-  const active = S.projects.filter((p) => p.status === 'active');
+  const active = sortedProjects().filter((p) => p.status === 'active');
   const projects = active.length ? active : S.projects;
   const start = projects.some((p) => p.id === ui.filter) ? ui.filter : projects[0].id;
   const panel = convoPanel({ linkable: true });
-  const project = select(S.projects.map((p) => [p.id, p.name]), start, (v) => panel.show(v));
+  const project = select(sortedProjects().map((p) => [p.id, p.name]), start, (v) => panel.show(v));
   const title = h('input', { type: 'text', placeholder: 'Short name for the task' });
   const desc = h('textarea', { rows: 5, placeholder: 'What to change, where, and how to tell it worked.' });
   const mode = select(MODES_SHORT, 'plan', () => {});
@@ -1022,8 +1186,7 @@ const BANG_MODE = /^(plan|edit)(?=$|[\s,;:.])/i;
 
 function bulkDialog() {
   if (!S.projects.length) return linkDialog();
-  const order = { active: 0, paused: 1, shipped: 2 };
-  const projects = [...S.projects].sort((x, y) => order[x.status] - order[y.status] || x.name.localeCompare(y.name));
+  const projects = sortedProjects();
   const eg = projects.map((p) => p.name);
   const panel = convoPanel({ picker: true });
   const limit = agentLimit((n) => api('PATCH', '/api/settings', { maxAgents: n }).then(() => { S.settings.maxAgents = n; }));
@@ -1229,8 +1392,8 @@ function projectDialog(pid) {
     h('dl', { class: 'kv' }, facts.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
     h('div', { style: 'display:flex; gap:8px; flex-wrap:wrap' },
       h('button', { class: 'btn small', onclick: () => conversationsDialog(p.id) }, 'Conversations'),
-      h('button', { class: 'btn small', onclick: () => api('POST', `/api/projects/${p.id}/open`, { app: 'finder' }) }, 'Open in Finder'),
-      h('button', { class: 'btn small', onclick: () => api('POST', `/api/projects/${p.id}/open`, { app: 'vscode' }) }, 'Open in VS Code')),
+      h('button', { class: 'btn small', onclick: () => { noteOpened(p.id); api('POST', `/api/projects/${p.id}/open`, { app: 'finder' }); } }, 'Open in Finder'),
+      h('button', { class: 'btn small', onclick: () => { noteOpened(p.id); api('POST', `/api/projects/${p.id}/open`, { app: 'vscode' }); } }, 'Open in VS Code')),
     field('Name', name),
     field('Folder', folder),
     h('div', { class: 'row' }, field('Status', status), field('Deadline', deadline)),
@@ -1338,7 +1501,8 @@ async function conversationReader(sessionId, back) {
 // ---------------------------------------------------------------- changes and usage
 
 function budgetInput(value, onchange, disabled) {
-  const fallback = S.settings.taskBudget > 0 ? `Default: ${money(S.settings.taskBudget)}` : 'No limit';
+  const fallback = S.settings.taskBudget > 0 ? `Default: ${money(S.settings.taskBudget)}`
+    : usageMode() === 'saver' && S.usage ? `Saver: ${money(S.usage.saverBudget)}` : 'No limit';
   return h('input', { type: 'number', min: 0, step: 0.5, placeholder: fallback, disabled, value: value > 0 ? String(value) : '', onchange: (e) => onchange(Math.max(0, Number(e.target.value) || 0)) });
 }
 
@@ -1385,6 +1549,13 @@ function spendChart(days) {
     h('div', { class: 'chart-x' }, h('span', null, dayLabel(days[0].at)), h('span', null, dayLabel(days[7].at)), h('span', null, 'Today')));
 }
 
+async function setUsageMode(mode) {
+  try { await api('PATCH', '/api/settings', { usageMode: mode }); } catch { /* the error is already shown */ }
+  await refresh().catch(() => {});
+  const m = USAGE_MODES.find((x) => x[0] === usageMode());
+  toast(`Usage mode: ${m[1]}. It applies to agents that start from now on.`);
+}
+
 function usageDialog() {
   const u = S.usage;
   const s = S.settings;
@@ -1403,7 +1574,7 @@ function usageDialog() {
   const rows = Object.entries(u.byProject).sort((a, b) => b[1].month - a[1].month || b[1].all - a[1].all);
   const name = (pid) => (S.projects.find((p) => p.id === pid) || { name: '(removed project)' }).name;
   const daily = h('input', { type: 'number', min: 0, step: 1, value: s.dailyBudget > 0 ? String(s.dailyBudget) : '', placeholder: 'No limit' });
-  const perRun = h('input', { type: 'number', min: 0, step: 0.5, value: s.taskBudget > 0 ? String(s.taskBudget) : '', placeholder: 'No limit' });
+  const perRun = h('input', { type: 'number', min: 0, step: 0.5, value: s.taskBudget > 0 ? String(s.taskBudget) : '', placeholder: usageMode() === 'saver' ? `Saver: ${money(u.saverBudget)}` : 'No limit' });
   const hold = h('input', { type: 'number', min: 0, max: 100, step: 5, value: s.holdPercent > 0 ? String(s.holdPercent) : '', placeholder: 'Never' });
   // Reads the limits afresh, for when you know they changed (a reset, say).
   const check = serverHas(3) && h('button', { class: 'link', onclick: async () => {
@@ -1417,8 +1588,27 @@ function usageDialog() {
     } catch { check.disabled = false; check.textContent = 'Check now'; }
   } }, 'Check now');
 
+  const modeBox = serverHas(5) && h('div', null,
+    h('div', { class: 'sect-title' }, 'Usage mode'),
+    h('div', { class: 'modes' }, USAGE_MODES.map(([key, label, about]) => h('label', { class: `mode-row${usageMode() === key ? ' on' : ''}` },
+      h('input', { type: 'radio', name: 'usage-mode', checked: usageMode() === key, onchange: async () => { await setUsageMode(key); usageDialog(); } }),
+      h('strong', null, label),
+      h('span', { class: 'hint' }, about)))),
+    h('p', { class: 'hint', style: 'margin-top:8px' }, 'In Saver and Balanced, agents also start by how much of your 5-hour limit they are likely to take, not just by how many are running: a new one starts only if it fits under the pause level below, next to those already running. In every mode, an agent that a limit cuts off waits for the reset and then continues by itself.'));
+  const typical = serverHas(5) && u.typical && h('div', null,
+    h('div', { class: 'sect-title' }, 'What one agent run usually takes'),
+    h('div', { class: 'md' }, h('div', { class: 'table' }, h('table', { class: 'usage-table' },
+      h('tr', null, ['Model', 'Usage of a run', 'About this much of the 5-hour limit', 'Based on'].map((c) => h('th', null, c))),
+      u.typical.map((r) => h('tr', null,
+        h('td', null, modelLabel(r.family)),
+        h('td', null, money(r.cost)),
+        h('td', null, r.points < 1 ? 'under 1%' : `${Math.round(r.points)}%`),
+        h('td', null, r.runs ? `your last ${plural(r.runs, 'run')}` : 'a starting guess')))))),
+    h('p', { class: 'hint', style: 'margin-top:8px' }, `The dashboard uses these to decide how many agents fit at once. They are learned from your own runs: the usage figure is one that three runs in four stay under, and one dollar of agent work is counted as about ${u.rate.toFixed(1)}% of your 5-hour limit.`));
+
   showDialog('Usage and budgets', [
     u.hold && h('div', { class: 'banner bad', style: 'border-radius:8px; border:0' }, u.hold),
+    modeBox,
     h('div', { class: 'tiles' },
       tile('Today', money(u.totals.today), s.dailyBudget > 0 ? `of ${money(s.dailyBudget)} daily limit` : null),
       tile('This week', money(u.totals.week)),
@@ -1428,6 +1618,7 @@ function usageDialog() {
       limits.length
         ? [h('div', { class: 'limits' }, limits), h('p', { class: 'hint', style: 'margin-top:8px' }, `As of ${ago(u.limits.at)}. This updates each time a dashboard agent runs, and every few minutes while tasks are paused by a limit. Your own Claude sessions use the same limits, so the real number can differ. `, check)]
         : h('p', { class: 'hint' }, 'Shown after the first agent run. ', check)),
+    typical,
     h('div', null, h('div', { class: 'sect-title' }, 'Spend per day, last 14 days'), spendChart(u.days)),
     rows.length ? h('div', null,
       h('div', { class: 'sect-title' }, 'By project'),
@@ -1457,9 +1648,21 @@ $('#btn-new').addEventListener('click', newTaskDialog);
 $('#btn-link').addEventListener('click', () => linkDialog());
 $('#btn-settings').addEventListener('click', settingsDialog);
 $('#btn-suggest').addEventListener('click', suggestDialog);
+$('#usage-mode').addEventListener('change', (e) => setUsageMode(e.target.value));
 $('#dlg').addEventListener('close', () => { ui.onState = null; });
 $('#usage').addEventListener('click', usageDialog);
 $('#btn-refresh').addEventListener('click', () => refresh(true).then(() => toast('Project info refreshed.')).catch(() => {}));
+$('#proj-sort').replaceChildren(...PROJECT_SORTS.map(([v, label]) => h('option', { value: v }, label)));
+$('#proj-sort').value = projSort();
+$('#proj-sort').addEventListener('change', (e) => setProjSort(e.target.value));
+{
+  const nav = $('#projects');
+  const hold = (on) => { if (ui.holdOrder === on) return; ui.holdOrder = on; if (!on) renderProjects(); };
+  nav.addEventListener('mouseenter', () => hold(true));
+  nav.addEventListener('mouseleave', () => { if (!nav.contains(document.activeElement)) hold(false); });
+  nav.addEventListener('focusin', () => hold(true));
+  nav.addEventListener('focusout', (e) => { if (!nav.contains(e.relatedTarget) && !nav.matches(':hover')) hold(false); });
+}
 $('#drawer').addEventListener('click', (e) => { if (e.target.dataset.close !== undefined) closeDrawer(); });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && ui.open && !$('#dlg').open) closeDrawer();

@@ -12,6 +12,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { spawn, execFile } = require('node:child_process');
 
 const PORT = Number(process.env.DASH_PORT) || 4577;
@@ -40,7 +41,11 @@ const TIERS = [
 const TIER_KEYS = TIERS.map((x) => x.key);
 // The page checks this number, so a page that is newer than the running
 // server can hide what the server cannot do yet.
-const API_VERSION = 4;
+const API_VERSION = 5;
+// How careful agents are with the Claude plan limit: see "usage modes" below.
+const USAGE_MODES = ['saver', 'balanced', 'full'];
+const SAVER_RUN_BUDGET = 3; // dollars for one run in Saver, when you set no limit yourself
+const MAX_LIMIT_RETRIES = 3; // times in a row a task may be cut off by a limit and continue by itself
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -55,11 +60,13 @@ let db = {
   // taskBudget and dailyBudget are in US dollars, 0 = no limit. holdPercent
   // pauses the queue when a Claude plan limit is that full, 0 = never.
   // autoMax is the strongest level the automatic model choice may pick.
-  settings: { maxAgents: 2, defaultModel: '', claudePath: '', taskBudget: 0, dailyBudget: 0, holdPercent: 90, autoMax: 'max' },
+  settings: { maxAgents: 2, defaultModel: '', claudePath: '', taskBudget: 0, dailyBudget: 0, holdPercent: 90, autoMax: 'max', usageMode: 'full' },
   projects: [],
   tasks: [],
   spend: [],     // one entry per agent run: { at, taskId, projectId, cost, model }
   limits: null,  // last Claude plan limits an agent reported
+  windows: {},   // per 5-hour window: how far agents pushed the limit, and what they spent
+  defaultFamily: '', // the model Claude Code picks when a task names none
 };
 
 function load() {
@@ -82,7 +89,7 @@ function load() {
       t.outcome = 'failed';
       t.finishedAt = Date.now();
       addLog(t, 'error', 'The dashboard was restarted while this agent was running.');
-    } else if (t.status === 'queued') {
+    } else if (t.status === 'queued' && !t.limitCut) {
       t.status = 'todo';
       t.assignee = null;
       t.waitReason = null;
@@ -235,16 +242,26 @@ function usage() {
       if (e.at >= days[i].at) { days[i].cost += e.cost; days[i].runs += run; break; }
     }
   }
-  return { totals, byProject, days, limits: db.limits, hold: holdReason() };
+  const rate = pointsPerDollar();
+  const typical = FAMILIES.map((fam) => {
+    const run = typicalRun(fam, 'edit');
+    return { family: fam, cost: run.cost, points: run.cost * rate, runs: run.runs || 0 };
+  });
+  return { totals, byProject, days, limits: db.limits, hold: holdReason(), mode: usageMode(), saverBudget: SAVER_RUN_BUDGET, rate, typical };
 }
 
 function recordSpend(t, result) {
   const cost = Number(result.total_cost_usd) || 0;
   t.cost = (t.cost || 0) + cost;
-  db.spend.push({ at: Date.now(), taskId: t.id, projectId: t.projectId, cost, model: (t.assignee && t.assignee.name) || '' });
+  db.spend.push({ at: Date.now(), taskId: t.id, projectId: t.projectId, cost, model: (t.assignee && t.assignee.name) || '',
+    mode: editing(t) ? 'edit' : 'plan', ms: Date.now() - (t.startedAt || Date.now()) });
+  const w = db.limits && db.limits.windows.five_hour;
+  const win = w && db.windows[String(w.resetsAt)];
+  if (win) win.cost += cost;
 }
 
-function recordLimits(ev) {
+// fromAgent: the reading came from a running dashboard agent.
+function recordLimits(ev, fromAgent) {
   const windows = ev.rate_limit_info && ev.rate_limit_info.unifiedWindows;
   if (!windows) return;
   const out = {};
@@ -252,7 +269,24 @@ function recordLimits(ev) {
     const w = windows[key];
     if (w && typeof w.utilization === 'number') out[key] = { utilization: w.utilization, resetsAt: Number(w.resetsAt) * 1000 };
   }
-  if (Object.keys(out).length) db.limits = { at: Date.now(), windows: out };
+  if (!Object.keys(out).length) return;
+  const now = Date.now();
+  db.limits = { at: now, windows: out };
+  // Learn what agent work costs in limit terms. Only the rise between two
+  // readings that agents sent close together is counted: that rise is their
+  // own work (plus whatever you did in other Claude sessions meanwhile).
+  const w = out.five_hour;
+  if (!w) return;
+  const key = String(w.resetsAt);
+  const win = db.windows[key] || (db.windows[key] = { gain: 0, cost: 0, lastU: w.utilization, agentAt: 0 });
+  if (fromAgent) {
+    if (now - win.agentAt < 10 * 60000 && w.utilization > win.lastU) win.gain += w.utilization - win.lastU;
+    win.agentAt = now;
+  }
+  win.lastU = w.utilization;
+  win.lastAt = now;
+  const keys = Object.keys(db.windows);
+  if (keys.length > 8) for (const k of keys.sort((a, b) => Number(a) - Number(b)).slice(0, keys.length - 8)) delete db.windows[k];
 }
 
 // Why new agents should wait right now, or null when they may start.
@@ -643,8 +677,26 @@ function guessTier(t) {
 // The level to really use: never above the limit set in Settings.
 function capTier(key) {
   const i = Math.max(0, TIER_KEYS.indexOf(key));
-  const top = TIER_KEYS.indexOf(db.settings.autoMax);
-  return TIERS[Math.min(i, top < 0 ? TIERS.length - 1 : top)];
+  let top = TIER_KEYS.indexOf(db.settings.autoMax);
+  if (top < 0) top = TIERS.length - 1;
+  if (usageMode() === 'saver') top = Math.min(top, TIER_KEYS.indexOf('optimized'));
+  return TIERS[Math.min(i, top)];
+}
+
+// What an Auto pick was made for. When the task text changes, it is sized again.
+const autoKey = (t) => crypto.createHash('md5')
+  .update([t.mode, t.title, t.description || '', t.kind || '', JSON.stringify(t.scan || '')].join('\n')).digest('hex');
+
+// True when the task has an Auto pick that still fits it. A follow-up keeps
+// the model its first run had; otherwise the pick follows today's cap.
+function sized(t) {
+  if (!t.auto) return false;
+  if (t.pendingFollowUp && t.sessionId) return true;
+  if (t.auto.key !== autoKey(t)) return false;
+  const tier = capTier(t.auto.asked);
+  t.auto.tier = tier.key;
+  t.auto.model = tier.model;
+  return true;
 }
 
 // Sets t.auto: the level and model the automatic choice gives this run.
@@ -661,9 +713,164 @@ async function chooseModel(t, p, bin) {
   }
   const tier = capTier(found.tier);
   const why = found.why.replace(/[.\s]+$/, '');
-  t.auto = { tier: tier.key, model: tier.model, why, at: Date.now() };
-  addLog(t, 'status', `Auto picked ${tier.label} (${tier.model}): ${why}.${tier.key !== found.tier ? ` Settings limit Auto to ${tier.label}.` : ''}`);
+  // asked = what the task needs; tier and model = what it gets under today's cap.
+  t.auto = { tier: tier.key, model: tier.model, asked: found.tier, why, key: autoKey(t), at: Date.now() };
+  const capped = tier.key === found.tier ? '' : usageMode() === 'saver' ? ` Usage saver keeps Auto at ${tier.label} or below.` : ` Settings limit Auto to ${tier.label}.`;
+  addLog(t, 'status', `Auto picked ${tier.label} (${tier.model}): ${why}.${capped}`);
   changed();
+}
+
+// ---------------------------------------------------------------- usage modes
+//
+// One switch for how careful agents are with the Claude plan limit:
+//   saver     "Default" means Auto, nothing runs above Opus, small models
+//             think less, every run has a spend limit, and a task Auto sizes
+//             as "max" first only plans.
+//   balanced  "Default" means Auto.
+//   full      Nothing is held back: "Default" is Claude Code's own model.
+// Saver and Balanced also start agents by how much of the limit they are
+// likely to take, not just by how many are running.
+
+const usageMode = () => (USAGE_MODES.includes(db.settings.usageMode) ? db.settings.usageMode : 'full');
+
+// The model choice a task runs with: its own, else the default.
+function wantedModel(t) {
+  const m = t.model || db.settings.defaultModel || (usageMode() === 'full' ? '' : 'auto');
+  return usageMode() === 'saver' && m === 'fable' ? 'opus' : m;
+}
+
+// The model the task will run on, as far as it is known. '' means Claude
+// Code's own default, or an Auto pick that has not been made yet.
+function runModel(t) {
+  const m = wantedModel(t);
+  return m === 'auto' ? ((t.auto && t.auto.model) || '') : m;
+}
+
+function runBudget(t) {
+  if (Number(t.budget) > 0) return Number(t.budget);
+  if (db.settings.taskBudget > 0) return db.settings.taskBudget;
+  return usageMode() === 'saver' ? SAVER_RUN_BUDGET : 0;
+}
+
+// Saver: the small models think less. The big ones keep their normal effort.
+const runEffort = (t) => (usageMode() === 'saver' ? { haiku: 'low', sonnet: 'medium' }[runModel(t)] || '' : '');
+
+// False for a plan-only task, and for an edit task that is still in its
+// "plan first" phase.
+const editing = (t) => t.mode === 'edit' && t.phase !== 'plan';
+
+// Saver: a task Auto sizes as "max" plans first and edits only after your OK.
+const plansFirst = (t) => usageMode() === 'saver' && t.mode === 'edit' && !t.kind && !t.planOk
+  && wantedModel(t) === 'auto' && Boolean(t.auto) && t.auto.asked === 'max';
+
+// ---------------------------------------------------------------- how much of the limit a run takes
+
+const FAMILIES = ['haiku', 'sonnet', 'opus', 'fable'];
+const family = (name) => (String(name || '').match(/haiku|sonnet|opus|fable/) || [''])[0];
+// Used until there are three runs of your own on a model: dollars at API
+// prices, and how long a run takes.
+const TYPICAL = {
+  haiku: { cost: 0.05, ms: 90e3 }, sonnet: { cost: 0.3, ms: 180e3 },
+  opus: { cost: 1.5, ms: 400e3 }, fable: { cost: 6, ms: 900e3 },
+};
+
+// From your own last runs on a model: the cost three runs in four stay
+// under, and the usual length.
+function typicalRun(fam, runMode) {
+  const base = TYPICAL[fam] || TYPICAL.opus;
+  const all = db.spend.filter((e) => !e.check && e.cost > 0 && family(e.model) === fam);
+  const modeOf = (e) => e.mode || (findTask(e.taskId) || {}).mode;
+  let runs = all.filter((e) => modeOf(e) === runMode).slice(-12);
+  if (runs.length < 3) runs = all.slice(-12);
+  if (runs.length < 3) return base;
+  const costs = runs.map((e) => e.cost).sort((a, b) => a - b);
+  const timed = runs.filter((e) => e.ms > 0);
+  return {
+    cost: costs[Math.min(costs.length - 1, Math.floor(costs.length * 0.75))],
+    ms: timed.length >= 3 ? timed.reduce((sum, e) => sum + e.ms, 0) / timed.length : base.ms,
+    runs: runs.length,
+  };
+}
+
+// How many points (percent) of the 5-hour limit one dollar of agent work
+// takes on your plan. Learned from the readings; 2 until there is enough.
+function pointsPerDollar() {
+  let gain = 0;
+  let cost = 0;
+  for (const w of Object.values(db.windows)) {
+    if (!(w.cost >= 2) || !(w.gain > 0)) continue;
+    gain += w.gain * 100;
+    cost += w.cost;
+  }
+  return cost ? Math.min(30, Math.max(0.2, gain / cost)) : 2;
+}
+
+function estimate(t) {
+  const fam = family(runModel(t)) || db.defaultFamily || 'fable';
+  const run = typicalRun(fam, editing(t) ? 'edit' : 'plan');
+  const cap = runBudget(t);
+  const cost = cap > 0 ? Math.min(run.cost, cap) : run.cost;
+  return { cost, ms: run.ms, points: cost * pointsPerDollar() };
+}
+
+// Is there room in the 5-hour limit to start this task next to the agents
+// already running? Gives null when it may start, else why it waits. A task
+// with nothing else running is never held here: the plain pause covers that.
+function roomFor(t) {
+  if (usageMode() === 'full' || !running.size) return null;
+  const now = Date.now();
+  const w = db.limits && db.limits.windows.five_hour;
+  const used = w && w.resetsAt > now ? w.utilization * 100 : 0;
+  const ceiling = db.settings.holdPercent > 0 ? db.settings.holdPercent : 100;
+  // What the running agents will still take. The part they already used is
+  // in the reading, so their share shrinks as they get older.
+  let reserved = 0;
+  for (const [id, st] of running) {
+    const other = findTask(id);
+    if (!other || !st.est) continue;
+    reserved += st.est.points * Math.max(0.2, 1 - (now - other.startedAt) / st.est.ms);
+  }
+  const need = estimate(t).points;
+  const free = ceiling - used - reserved;
+  if (need <= free) return null;
+  return `Waiting for room in your 5-hour limit: needs about ${Math.max(1, Math.round(need))}%, ${Math.max(0, Math.floor(free))}% is free`;
+}
+
+const LIMIT_NAME = { five_hour: '5-hour', seven_day: 'weekly' };
+const clockTime = (ms, withDay) => new Date(ms).toLocaleString('en-IN', withDay
+  ? { weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false }
+  : { hour: '2-digit', minute: '2-digit', hour12: false });
+
+// True while the limit that cut a task off is still full.
+function stillCut(t) {
+  if (!t.limitCut) return false;
+  const w = db.limits && db.limits.windows[t.limitCut.type];
+  if (w && w.resetsAt === t.limitCut.resetsAt) return w.resetsAt > Date.now() && w.utilization >= 0.95;
+  return !w && t.limitCut.resetsAt > Date.now();
+}
+
+// A run that a Claude plan limit cut off goes back in the queue, and
+// continues the same conversation by itself once the limit has reset.
+function parkForLimit(t, st) {
+  const w5 = db.limits && db.limits.windows.five_hour;
+  const lim = st.limit || { type: 'five_hour', resetsAt: (w5 && w5.resetsAt) || Date.now() + 3600e3 };
+  const count = ((t.limitCut && t.limitCut.count) || 0) + 1;
+  const name = LIMIT_NAME[lim.type] || 'plan';
+  if (count > MAX_LIMIT_RETRIES) {
+    return finish(t, 'failed', `Cut off by your Claude ${name} limit ${count} times in a row. Send a follow-up to continue when there is room.`);
+  }
+  running.delete(t.id);
+  t.limitCut = { type: lim.type, resetsAt: lim.resetsAt, count };
+  t.status = 'queued';
+  t.queuedAt = Date.now();
+  t.outcome = null;
+  t.finishedAt = null;
+  t.assignee = { kind: 'agent', name: '' };
+  t.pendingFollowUp = 'You were cut off by a usage limit, which has now reset. Continue the task from where you stopped.';
+  addLog(t, 'status', `Cut off by your Claude ${name} limit. It continues by itself after the reset (${clockTime(lim.resetsAt, lim.type !== 'five_hour')}).`);
+  infoCache.delete(t.projectId);
+  changed();
+  pump();
 }
 
 // Reads the Claude plan limits right now with one tiny Haiku call (about a
@@ -700,7 +907,8 @@ function refreshLimits() {
     child.stdin.end('OK');
   }).then((got) => {
     limitCheck = null;
-    if (got) { changed(); pump(); }
+    if (got) changed();
+    pump();
     return got;
   });
   return limitCheck;
@@ -880,8 +1088,9 @@ function systemPrompt(t) {
     "Work only inside the current project folder, and follow the project's CLAUDE.md.",
     'Never run git commit or git push. Leave changes uncommitted for the user to review.',
   ];
-  if (t.mode === 'plan') {
+  if (!editing(t)) {
     lines.push('This is a PLAN-ONLY task: do not change, create or delete any files. Read the code, then give your findings and a step-by-step plan as your final message.');
+    if (t.phase === 'plan') lines.push('The user reads your plan first and then decides whether you carry it out, so make the plan complete enough to act on.');
   }
   lines.push('Finish with a short report in plain, simple English: what you did or found, which files changed, how you checked it, and anything left over or needing the user\'s decision.');
   return lines.join('\n');
@@ -921,6 +1130,7 @@ function toolLine(name, input, cwd) {
 
 function finish(t, outcome, message) {
   running.delete(t.id);
+  delete t.limitCut;
   t.status = 'review';
   t.outcome = outcome;
   t.finishedAt = Date.now();
@@ -936,7 +1146,7 @@ function startAgent(t) {
   const followUp = t.pendingFollowUp;
   delete t.pendingFollowUp;
   delete t.force;
-  t.assignee = { kind: 'agent', name: t.model || db.settings.defaultModel || 'default model' };
+  t.assignee = { kind: 'agent', name: runModel(t) || (wantedModel(t) === 'auto' ? 'auto' : 'default model') };
   t.startedAt = Date.now();
   t.finishedAt = null;
   t.waitReason = null;
@@ -946,26 +1156,31 @@ function startAgent(t) {
   if (!bin) return finish(t, 'failed', 'Could not find the claude program. Set its path in Settings.');
 
   const resume = Boolean(followUp && t.sessionId);
-  const st = { child: null, stopped: false, result: null, plan: null, stderr: '', done: false };
+  // Usage saver: a big task only plans on its first run. A follow-up keeps
+  // the phase it is in, until you press "Carry out this plan".
+  if (!resume) { if (plansFirst(t)) t.phase = 'plan'; else delete t.phase; }
+  const st = { child: null, stopped: false, result: null, plan: null, stderr: '', done: false, limit: null, model: '', est: estimate(t) };
   running.set(t.id, st);
   t.status = 'running';
   t.runs = (t.runs || 0) + 1;
   t.steps = 0;
   if (!resume) { t.sessionId = null; t.report = ''; }
-  addLog(t, 'status', `${resume ? 'Agent resumed' : 'Agent started'} (${t.mode === 'edit' ? 'can edit files' : 'plan only'})`);
+  if (usageMode() === 'saver' && (t.model || db.settings.defaultModel) === 'fable') addLog(t, 'status', 'Usage saver: this run uses Optimized (opus) in place of Max (fable).');
+  addLog(t, 'status', `${resume ? 'Agent resumed' : 'Agent started'} (${editing(t) ? 'can edit files' : t.phase === 'plan' ? 'plans first: Usage saver asks for your OK before a task this big edits files' : 'plan only'})`);
   changed();
 
   // Before an editing run, remember how the files look, so the task can show
   // exactly what changed. A follow-up keeps the first starting point.
   let ready = Promise.resolve();
-  if (t.mode === 'edit' && !(resume && t.baseTree)) {
+  if (editing(t) && !(resume && t.baseTree)) {
     t.changes = null;
     ready = snapshotTree(p.path).then((tree) => { t.baseTree = tree; }).catch(() => { t.baseTree = null; });
   }
   // "Auto" first finds out what kind of task this is. A follow-up stays on
   // the model the first run was given.
-  if ((t.model || db.settings.defaultModel) !== 'auto') delete t.auto;
-  else if (!(resume && t.auto)) ready = Promise.all([ready, chooseModel(t, p, bin)]);
+  // (The queue normally has sized the task already; this is the safety net.)
+  if (wantedModel(t) !== 'auto') delete t.auto;
+  else if (!(resume && t.auto) && !sized(t)) ready = Promise.all([ready, chooseModel(t, p, bin)]);
   ready.then(() => {
     if (st.stopped) { st.done = true; return finish(t, 'stopped', 'Stopped by you.'); }
     launchAgent(t, p, st, bin, resume, followUp);
@@ -975,12 +1190,14 @@ function startAgent(t) {
 function launchAgent(t, p, st, bin, resume, followUp) {
   const args = [
     '-p', '--output-format', 'stream-json', '--verbose',
-    '--permission-mode', t.mode === 'edit' ? 'auto' : 'plan',
+    '--permission-mode', editing(t) ? 'auto' : 'plan',
     '--append-system-prompt', systemPrompt(t),
   ];
-  const wanted = t.model || db.settings.defaultModel;
-  const model = wanted === 'auto' ? (t.auto && t.auto.model) : wanted;
+  const model = runModel(t);
+  st.model = model;
   if (model) args.push('--model', model);
+  const effort = runEffort(t);
+  if (effort) args.push('--effort', effort);
   if (resume) args.push('--resume', t.sessionId);
   if (t.kind === 'scan') {
     // The answer has to come back as data the board can turn into tasks.
@@ -988,7 +1205,7 @@ function launchAgent(t, p, st, bin, resume, followUp) {
     const outside = t.scan && t.scan.notes === false ? [] : findNotes(p.path).outside;
     if (outside.length) args.push('--add-dir', ...outside);
   }
-  const budget = Number(t.budget) > 0 ? Number(t.budget) : db.settings.taskBudget;
+  const budget = runBudget(t);
   if (budget > 0) args.push('--max-budget-usd', String(budget));
   // Three layers keep agents from committing or pushing: a check that runs
   // before every shell command, git hooks that refuse inside git itself, and
@@ -1045,9 +1262,11 @@ function launchAgent(t, p, st, bin, resume, followUp) {
     raw.end();
     const r = st.result;
     if (r) recordSpend(t, r);
-    if (t.mode === 'edit' && !spawnError) await saveChanges(t, p.path).catch(() => {});
+    if (editing(t) && !spawnError) await saveChanges(t, p.path).catch(() => {});
     if (st.stopped) return finish(t, 'stopped', 'Stopped by you.');
     if (spawnError) return finish(t, 'failed', `Could not start the agent: ${spawnError.message}`);
+    // Cut off by a Claude plan limit: wait for the reset, then carry on.
+    if (r ? r.is_error && (r.api_error_status === 429 || st.limit) : st.limit) return parkForLimit(t, st);
     if (!r) {
       const tail = st.stderr.trim().split('\n').slice(-3).join(' ');
       return finish(t, 'failed', `The agent ended without a result (exit code ${code}). ${tail}`.trim());
@@ -1059,7 +1278,8 @@ function launchAgent(t, p, st, bin, resume, followUp) {
       if (/budget/i.test(r.subtype || '')) {
         return finish(t, 'failed', `Stopped: this run reached its spend limit ($${Number(r.total_cost_usd || 0).toFixed(2)}). Raise the limit or send a follow-up to continue.`);
       }
-      return finish(t, 'failed', `The agent stopped with an error (${r.subtype || 'unknown'}).`);
+      const said = answer.split('\n')[0].slice(0, 200);
+      return finish(t, 'failed', said ? `The agent stopped with an error: ${said}` : `The agent stopped with an error (${r.subtype || 'unknown'}).`);
     }
     if (t.kind === 'scan') {
       const got = readSuggestions(r.structured_output, t.runs) || readSuggestions(looseJson(answer), t.runs);
@@ -1074,6 +1294,7 @@ function launchAgent(t, p, st, bin, resume, followUp) {
       return finish(t, 'ok', count ? `${count} suggestion${count === 1 ? '' : 's'} ready. Tick the ones you want as tasks.` : 'Finished: nothing to suggest right now.');
     }
     t.report = answer || '(The agent finished without writing a report.)';
+    if (t.phase === 'plan') return finish(t, 'ok', 'Plan ready. Read it, then press "Carry out this plan" to let the agent edit files.');
     finish(t, 'ok', 'Agent finished. Waiting for your review.');
   };
   child.on('error', (e) => end(null, e));
@@ -1082,10 +1303,16 @@ function launchAgent(t, p, st, bin, resume, followUp) {
 
 function onEvent(t, st, ev, cwd) {
   if (ev.type === 'rate_limit_event') {
-    recordLimits(ev);
+    const info = ev.rate_limit_info || {};
+    if (info.status === 'rejected') st.limit = { type: info.rateLimitType || 'five_hour', resetsAt: Number(info.resetsAt) * 1000 || Date.now() + 3600e3 };
+    recordLimits(ev, true);
+    pumpSoon(); // a fresh reading can make room for a waiting task
   } else if (ev.type === 'system' && ev.subtype === 'init') {
     t.sessionId = ev.session_id || t.sessionId;
-    if (ev.model) t.assignee = { kind: 'agent', name: ev.model };
+    if (ev.model) {
+      t.assignee = { kind: 'agent', name: ev.model };
+      if (!st.model) db.defaultFamily = family(ev.model) || db.defaultFamily;
+    }
   } else if (ev.type === 'assistant' && !ev.parent_tool_use_id) {
     for (const block of (ev.message && ev.message.content) || []) {
       if (block.type === 'text' && block.text && block.text.trim()) {
@@ -1120,23 +1347,58 @@ function setWait(t, reason) {
   if (t.waitReason !== reason) { t.waitReason = reason; changed(); }
 }
 
+const sizing = new Set(); // ids of tasks whose Auto pick is being made
+let pumpTimer = null;
+function pumpSoon() {
+  if (pumpTimer) return;
+  pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, 1500);
+}
+
 function pump() {
   const rank = (t) => PRIORITIES.indexOf(t.priority);
   const queued = db.tasks
     .filter((t) => t.status === 'queued')
     .sort((a, b) => rank(b) - rank(a) || a.queuedAt - b.queuedAt);
-  const hold = queued.length ? holdReason() : null;
+  if (!queued.length) return;
+  const now = Date.now();
+  const hold = holdReason();
   // A plan limit can be reset before the time it gave. While tasks wait on
   // one, look again every few minutes.
-  if (queued.length && planLimitHold() && Date.now() - limitCheckedAt > LIMIT_RECHECK_MS) refreshLimits();
+  if ((planLimitHold() || queued.some(stillCut)) && now - limitCheckedAt > LIMIT_RECHECK_MS) refreshLimits();
+  const bin = findClaude();
+  // How many agents fit depends on how full the limit is, so starting one
+  // next to another takes a recent reading. The first may always go.
+  const stale = usageMode() !== 'full' && Boolean(bin) && (!db.limits || now - db.limits.at > 3 * 60000);
   for (const t of queued) {
+    if (stillCut(t) && !t.force) {
+      const c = t.limitCut;
+      setWait(t, `Waiting for your Claude ${LIMIT_NAME[c.type] || 'plan'} limit to reset (${clockTime(c.resetsAt, c.type !== 'five_hour')}). Then it continues by itself`);
+      continue;
+    }
     if (hold && !t.force) { setWait(t, hold); continue; }
+    // Auto: find out what kind of task this is before deciding when it may start.
+    const p = findProject(t.projectId);
+    if (bin && p && wantedModel(t) === 'auto' && !sized(t)) {
+      if (!sizing.has(t.id)) {
+        sizing.add(t.id);
+        chooseModel(t, p, bin).catch(() => {}).then(() => { sizing.delete(t.id); pump(); });
+      }
+      setWait(t, 'Checking what kind of task this is');
+      continue;
+    }
     if (running.size >= db.settings.maxAgents) { setWait(t, 'Waiting for a free agent slot'); continue; }
     const clash = t.mode === 'edit' && [...running.keys()].some((id) => {
       const other = findTask(id);
-      return other && other.projectId === t.projectId && other.mode === 'edit';
+      return other && other.projectId === t.projectId && editing(other);
     });
     if (clash) { setWait(t, 'Waiting: another agent is editing this project'); continue; }
+    if (stale && running.size && !t.force) {
+      if (!limitCheck && now - limitCheckedAt > 60000) refreshLimits();
+      // (If the check cannot run right now, go by the reading there is.)
+      if (limitCheck) { setWait(t, 'Checking how full your Claude limit is'); continue; }
+    }
+    const room = t.force ? null : roomFor(t);
+    if (room) { setWait(t, room); continue; }
     startAgent(t);
   }
 }
@@ -1178,6 +1440,7 @@ function newTask(f) {
 
 function queueTask(t) {
   delete t.ide;
+  delete t.limitCut;
   t.status = 'queued';
   t.queuedAt = Date.now();
   t.outcome = null;
@@ -1359,6 +1622,7 @@ const api = {
       }
       t.waitReason = null;
       delete t.pendingFollowUp;
+      delete t.limitCut;
       addLog(t, 'status', { todo: 'Moved back to To do', review: 'Moved to Needs review', done: 'Marked done' }[to]);
       t.status = to;
     }
@@ -1404,6 +1668,8 @@ const api = {
       if (t.status === 'queued' && body.force) { t.force = true; changed(); pump(); return briefTask(t); }
       if (t.status === 'running' || t.status === 'queued') throw new HttpError(409, 'This task is already running or queued.');
       if (body.mode && t.kind !== 'scan') t.mode = pick(body.mode, MODES, 'mode');
+      // "Carry out this plan" on a task that planned first: your OK to edit.
+      if (body.mode === 'edit' && t.phase === 'plan') { delete t.phase; t.planOk = true; }
       const message = text(body.message, 20000).trim();
       if (message) { t.pendingFollowUp = message; addLog(t, 'you', message); } else delete t.pendingFollowUp;
       if (body.force) t.force = true;
@@ -1413,7 +1679,17 @@ const api = {
     } else if (action === 'stop') {
       const st = running.get(t.id);
       if (st) killAgent(st);
-      else if (t.status === 'queued') { t.status = 'todo'; t.assignee = null; t.waitReason = null; delete t.pendingFollowUp; delete t.force; changed(); }
+      else if (t.status === 'queued') {
+        // A task that was waiting for a limit reset keeps what it did so far.
+        const parked = Boolean(t.limitCut);
+        t.status = parked ? 'review' : 'todo';
+        if (parked) { t.outcome = 'stopped'; t.finishedAt = Date.now(); addLog(t, 'status', 'You stopped it from continuing after the limit reset.'); } else t.assignee = null;
+        t.waitReason = null;
+        delete t.pendingFollowUp;
+        delete t.force;
+        delete t.limitCut;
+        changed();
+      }
       else throw new HttpError(409, 'No agent is running on this task.');
     } else if (action === 'claim') {
       if (t.status === 'running' || t.status === 'queued') {
@@ -1594,6 +1870,7 @@ const api = {
     if ('maxAgents' in body) db.settings.maxAgents = Math.min(16, Math.max(1, Math.round(Number(body.maxAgents)) || 1));
     if ('defaultModel' in body) db.settings.defaultModel = pick(body.defaultModel, MODELS, 'model');
     if ('autoMax' in body) db.settings.autoMax = pick(body.autoMax, TIER_KEYS, 'level');
+    if ('usageMode' in body) db.settings.usageMode = pick(body.usageMode, USAGE_MODES, 'usage mode');
     if ('claudePath' in body) db.settings.claudePath = text(body.claudePath, 500).trim();
     const money = (v) => Math.min(100000, Math.max(0, Math.round((Number(v) || 0) * 100) / 100));
     if ('taskBudget' in body) db.settings.taskBudget = money(body.taskBudget);

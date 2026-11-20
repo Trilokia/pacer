@@ -20,6 +20,17 @@ Then open http://localhost:4577. Keep the Terminal window open; closing it stops
 - **Find projects inside it** lists the folders inside a parent folder so you can link many at once.
 - Each project shows its kind, git branch, number of uncommitted files and last commit. **Refresh** re-reads these.
 - The `···` button on a project opens its details: rename, change the folder, set a status, deadline and notes, open it in Finder or VS Code, or unlink it.
+- **Sort** above the list picks the order:
+
+| Sort | Order |
+|---|---|
+| Priority (auto) | A deadline in the next 2 weeks first (nearest first), then most high-priority open tasks, then most tasks waiting for review, then most open tasks |
+| Recently opened / Least recently opened | By when you last clicked the project in the list, or opened it in Finder or VS Code |
+| Most opened | By how often you opened it |
+| A to Z | By name |
+| Custom | Your own order: drag projects, or press Alt+Up / Alt+Down on a selected one. Dragging in any other sort switches to Custom |
+
+Paused and shipped projects stay below the active ones, except in Custom. The list doesn't reshuffle while your mouse is on it, so the project you click stays put. The sort choice, your custom order and the open history are saved in this browser only. The add-task and AI-suggestions dialogs list projects in the same order.
 
 ## Tasks
 
@@ -128,6 +139,25 @@ The strip at the top shows today's spend and how full your Claude plan limits ar
 - **Plan-limit pause:** new agents wait when your 5-hour or weekly Claude limit is this full (90% by default), so background work does not use up what you need yourself.
 
 Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts are what the runs would cost at API prices; on a Claude subscription you are not billed them. The plan-limit numbers update each time a dashboard agent runs. While tasks are paused by a full limit, the dashboard reads the limit again every 5 minutes, so a limit that was reset early is noticed and the queue starts again. **Check now** in the Usage dialog reads it right away.
+
+### Usage mode
+
+The **Usage** switch in the top bar sets how careful agents are with your Claude limit. It applies to agents that start after you change it.
+
+| | Saver | Balanced | Full power |
+|---|---|---|---|
+| A task set to "Default" runs on | Auto | Auto | Claude Code's own model |
+| Strongest model | Optimized (Opus), even if a task says Max | no cap | no cap |
+| Thinking effort | lower on Haiku and Sonnet | normal | normal |
+| Spend limit for one run | $3 unless you set one | only if you set one | only if you set one |
+| A task Auto sizes as Max | plans first, edits after your OK | runs directly | runs directly |
+| Starting agents | by room in the limit | by room in the limit | by count |
+
+**Starting by room in the limit.** In Saver and Balanced, the dashboard estimates how much of your 5-hour limit a run will take, from your own past runs on that model, and starts a waiting task only if it fits under the plan-limit pause level next to the agents already running. So nine small tasks can run together, while big Fable tasks go a few at a time. A waiting task says how much it needs and how much is free; **Run anyway** starts it regardless. The first agent is never held this way. The estimates and what they are based on are shown under "What one agent run usually takes" in the Usage dialog. They are rough: your own Claude sessions use the same limit.
+
+**Plan first.** In Saver, a task that Auto sizes as Max only plans on its first run. Read the plan, then press **Carry out this plan** to let the agent edit files.
+
+**Cut off by a limit.** In every mode, an agent that your 5-hour or weekly limit cuts off goes back in the queue and continues the same conversation by itself once the limit resets (also after a restart of the dashboard). If it is cut off more than three times in a row it stops and waits for you. **Cancel** on such a task keeps what it did so far.
 
 ### Limits that keep things safe
 

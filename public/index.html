@@ -15,6 +15,11 @@
   </div>
   <div class="top-actions">
     <button id="usage" class="usage" title="Usage and budgets"></button>
+    <select id="usage-mode" class="mode-pick" title="How careful agents are with your Claude limit. Details are in Usage and budgets." aria-label="Usage mode" hidden>
+      <option value="saver">Usage: Saver</option>
+      <option value="balanced">Usage: Balanced</option>
+      <option value="full">Usage: Full power</option>
+    </select>
     <button id="btn-settings" class="btn ghost">Settings</button>
     <button id="btn-link" class="btn">Link project</button>
     <button id="btn-suggest" class="btn" hidden title="Let Claude look at your projects and suggest what to do next">AI suggestions</button>
@@ -30,6 +35,8 @@
       <h2>Projects</h2>
       <button id="btn-refresh" class="link" title="Re-read git status for every project">Refresh</button>
     </div>
+    <label class="side-sort"><span>Sort</span><select id="proj-sort" aria-label="Sort projects"></select></label>
+    <p id="proj-tip" class="side-tip muted" hidden>Drag projects to arrange them (or Alt+Up / Alt+Down).</p>
     <nav id="projects"></nav>
   </aside>
   <main>

@@ -1348,6 +1348,9 @@ function setWait(t, reason) {
 }
 
 const sizing = new Set(); // ids of tasks whose Auto pick is being made
+// Each check is a Claude process of about 200 MB. With many tasks queued at
+// once, all of them at the same moment would use up this Mac's memory.
+const SIZING_MAX = 3;
 let pumpTimer = null;
 function pumpSoon() {
   if (pumpTimer) return;
@@ -1379,11 +1382,11 @@ function pump() {
     // Auto: find out what kind of task this is before deciding when it may start.
     const p = findProject(t.projectId);
     if (bin && p && wantedModel(t) === 'auto' && !sized(t)) {
-      if (!sizing.has(t.id)) {
+      if (!sizing.has(t.id) && sizing.size < SIZING_MAX) {
         sizing.add(t.id);
         chooseModel(t, p, bin).catch(() => {}).then(() => { sizing.delete(t.id); pump(); });
       }
-      setWait(t, 'Checking what kind of task this is');
+      setWait(t, sizing.has(t.id) ? 'Checking what kind of task this is' : 'Waiting to check what kind of task this is');
       continue;
     }
     if (running.size >= db.settings.maxAgents) { setWait(t, 'Waiting for a free agent slot'); continue; }

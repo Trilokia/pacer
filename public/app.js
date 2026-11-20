@@ -976,6 +976,15 @@ function suggestDialog() {
   }
 
   const sections = new Map(); // project id -> { key, el }
+  // Ticks (or unticks) every suggestion not yet on the board.
+  const tickAll = (list, on) => {
+    for (const t of list) for (const s of openSuggestions(t)) {
+      const key = selKey(t, s);
+      ui.sel.set(key, { ...(ui.sel.get(key) || { mode: s.mode }), on });
+    }
+    sections.clear();
+    paint();
+  };
   function section(p, t) {
     const failed = t.status === 'review' && t.outcome === 'failed';
     return h('section', null,
@@ -983,6 +992,7 @@ function suggestDialog() {
         h('h4', null, p.name),
         h('span', { class: 'hint' }, [busy(t) ? 'Looking again…' : ago(t.finishedAt), t.cost ? money(t.cost) : null].filter(Boolean).join(' · ')),
         h('span', { class: 'spacer' }),
+        openSuggestions(t).length > 1 && h('button', { class: 'link', onclick: () => tickAll([t], true) }, 'Tick all'),
         h('button', { class: 'link', onclick: () => { closeDialog(); openTask(t.id); } }, `Open ${t.id}`)),
       failed && h('p', { class: 'bulk-err' }, `The last look did not finish. Open ${t.id} to see why.`),
       t.summary && h('p', { class: 'sug-summary' }, t.summary),
@@ -1025,7 +1035,12 @@ function suggestDialog() {
       h('ul', { class: 'found sug-projects' }, rows.map((r) => r.el))),
     h('div', { class: 'sug-actions' }, goBtn,
       h('span', { class: 'hint' }, 'One agent per project. Quick takes about a minute each. Thorough reads the code too, so it takes several minutes and uses much more of your Claude limit.')),
-    h('div', null, h('div', { class: 'sect-title' }, 'Suggestions'), none, results),
+    h('div', null,
+      h('div', { class: 'sug-pickers' },
+        h('span', { class: 'sect-title' }, 'Suggestions'),
+        h('button', { class: 'link', onclick: () => tickAll(scans(), true) }, 'Tick all'),
+        h('button', { class: 'link', onclick: () => tickAll(scans(), false) }, 'Untick all')),
+      none, results),
   ], [
     h('button', { class: 'btn ghost', onclick: closeDialog }, 'Close'),
     h('span', { class: 'spacer' }),

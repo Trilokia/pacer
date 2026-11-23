@@ -1,8 +1,8 @@
 # Pacer
 
-A task board for all your projects that runs on your Mac. You link project folders, add tasks, and either let Pacer start Claude Code agents on them or let your own Claude sessions in VS Code pick them up. It paces the agents against your Claude plan limits, so a long queue finishes whole projects instead of leaving every project half done when the limit runs out. Progress and final reports show up on the board.
+A task board for all your projects that runs on your own computer (macOS, Windows or Linux). You link project folders, add tasks, and either let Pacer start Claude Code agents on them or let your own Claude sessions in VS Code pick them up. It paces the agents against your Claude plan limits, so a long queue finishes whole projects instead of leaving every project half done when the limit runs out. Progress and final reports show up on the board.
 
-It needs only Node (no `npm install`). It listens on this Mac only and is not reachable from the network.
+Pacer is a small web app: a Node server on your computer, and a page you open in your browser. It needs only Node (no `npm install`). It listens on your computer only and is not reachable from the network. It runs on your computer rather than as a website because it starts `claude` in your project folders.
 
 ![The Pacer board with a few demo projects and tasks](docs/screenshot.png)
 
@@ -10,10 +10,10 @@ It needs only Node (no `npm install`). It listens on this Mac only and is not re
 
 ## Requirements
 
-- **macOS.** Notifications, the folder picker, the Finder buttons and `start.command` use macOS tools. Pacer is built and tested on macOS only.
+- **macOS, Windows 10/11 or Linux.** macOS is where Pacer is used every day; on Windows and Linux the tests run on every push (see [Tests](#tests)).
 - **Node.js 20 or newer.** There is nothing to install with npm.
 - **Claude Code** (the `claude` command), signed in. Agents use your own Claude plan or API key, and everything they do counts against your limits. Pacer finds `claude` on your PATH, in the usual install folders, or inside the VS Code extension; if it can't, set the path in Settings.
-- **git**, for project status, the Changes view and separate copies.
+- **git**, for project status, the Changes view and separate copies. On Windows, Claude Code itself also needs Git for Windows.
 - Optional: **VS Code** with the Claude Code extension (for the "Continue in VS Code" buttons) and the GitHub **`gh`** command (for pull requests from separate copies).
 
 ## Before you use "Edit files"
@@ -34,31 +34,29 @@ node server.js
 
 ## Start it
 
-Double-click `start.command`, or run:
+- **macOS:** double-click `start.command`.
+- **Windows:** double-click `start.cmd`.
+- **Any system:** run `node server.js --open` (or just `node server.js`, then open http://localhost:4577).
 
-```
-node server.js
-```
-
-Then open http://localhost:4577. Keep the Terminal window open; closing it stops Pacer and any agents it started.
+Keep the terminal window open; closing it stops Pacer and any agents it started.
 
 ## Light and dark
 
-The moon / sun button in the top bar switches between the light and the dark theme. The page follows this Mac's setting until you choose; Settings has "Same as this Mac" to go back to that.
+The moon / sun button in the top bar switches between the light and the dark theme. The page follows your computer's setting until you choose; Settings has "Same as this computer" to go back to that.
 
 ## Projects
 
 - **Link project** remembers a folder. Nothing is copied, moved or changed.
 - **Find projects inside it** lists the folders inside a parent folder so you can link many at once.
 - Each project shows its kind, git branch, number of uncommitted files and last commit. **Refresh** re-reads these.
-- The `···` button on a project opens its details: rename, change the folder, set a status, deadline and notes, open it in Finder or VS Code, or unlink it.
+- The `···` button on a project opens its details: rename, change the folder, set a status, deadline and notes, open it in your file manager (Finder, File Explorer) or VS Code, or unlink it.
 - **Tags** group similar projects, for example by framework ("Android", "Node") or by kind of work ("Client work"). Type them in a project's details, with commas between them; the chips under the box add a tag another project already has, or the project's kind, with one click. The tags then show as chips above the project list. Click one to see only those projects and their tasks; click it again to see everything. A project can have up to 8 tags.
 - **Sort** above the list picks the order:
 
 | Sort | Order |
 |---|---|
 | Priority (auto) | A deadline in the next 2 weeks first (nearest first), then most high-priority open tasks, then most tasks waiting for review, then most open tasks |
-| Recently opened / Least recently opened | By when you last clicked the project in the list, or opened it in Finder or VS Code |
+| Recently opened / Least recently opened | By when you last clicked the project in the list, or opened it in the file manager or VS Code |
 | Most opened | By how often you opened it |
 | A to Z | By name |
 | Custom | Your own order: drag projects, or press Alt+Up / Alt+Down on a selected one. Dragging in any other sort switches to Custom |
@@ -103,7 +101,7 @@ Normally two agents never edit the same project at once; the second waits. Tick 
 
 ### Notifications
 
-Pacer shows a Mac notification when a task finishes, needs your OK, or your limit runs out. Several at once are folded into one. Settings can turn this off, and can also send the same lines to your phone through ntfy.sh if you give it a topic name (that sends the task id, project name and title to that outside service).
+Pacer shows a desktop notification when a task finishes, needs your OK, or your limit runs out (on Linux this needs `notify-send`). Several at once are folded into one. Settings can turn this off, and can also send the same lines to your phone through ntfy.sh if you give it a topic name (that sends the task id, project name and title to that outside service).
 
 ### Working on a task yourself in VS Code
 
@@ -174,7 +172,7 @@ In **Settings** you can make Auto the model for every task set to "Default", and
 
 ### Claude conversations
 
-Claude Code saves every conversation on this Mac, per folder. Pacer reads them (it never changes them):
+Claude Code saves every conversation on your computer, per folder. Pacer reads them (it never changes them):
 
 - **Conversations** on a project (next to its path on the board, or in its `···` details) lists the saved conversations for that folder. Click one to read it.
 - A task's **Conversations** section shows the Pacer agent's own conversation and any you linked with **Link a conversation**.
@@ -182,7 +180,7 @@ Claude Code saves every conversation on this Mac, per folder. Pacer reads them (
 
 Both add-task dialogs show the chosen project's recent conversations on the right, so you can see where it stands while you write. Open one to see what you last asked and how Claude ended.
 
-Claude removes saved conversations after about 30 days, and chats on claude.ai are not stored on the Mac, so neither can be shown.
+Claude removes saved conversations after about 30 days, and chats on claude.ai are not stored on your computer, so neither can be shown.
 
 ### Reviewing what changed
 
@@ -238,7 +236,7 @@ To go back to the old order (priority and time only, projects mixed), choose "Mi
 
 ### Limits that keep things safe
 
-- At most 2 agents run at once by default. You choose the number in Settings or in the "several tasks" dialog, up to one per project (16 at most). Pacer tells you what this Mac's memory can comfortably take, but the choice is yours. Extra tasks wait in the queue.
+- At most 2 agents run at once by default. You choose the number in Settings or in the "several tasks" dialog, up to one per project (16 at most). Pacer tells you what your computer's memory can comfortably take, but the choice is yours. Extra tasks wait in the queue.
 - Two agents never edit the same project at the same time.
 - Agents cannot commit or push. A check runs before each of their shell commands (`guard/pre-tool.js`), and git itself refuses through hooks in `guard/githooks/` that apply only to agent runs. Your own git commands are not affected.
 - Editing agents run in Claude Code's `auto` permission mode, which blocks risky actions on its own.
@@ -262,10 +260,10 @@ In a session you can simply say "pick up T12 from Pacer".
 
 ## Known limits
 
-- Built and tested on macOS only.
+- Used every day on macOS. On Windows and Linux the automatic tests pass (they start and stop a stand-in agent), but these extras have not been tried by hand yet: desktop notifications, the **Browse…** folder picker (PowerShell on Windows, `zenity` on Linux) and the VS Code buttons. If one fails, type the folder path instead, or use phone notifications.
 - Pacer reads some parts of Claude Code's output that are not a documented interface: the plan-limit readings, the model names (haiku, sonnet, opus, fable) and the VS Code extension's link format. A Claude Code update can break the usage features or the VS Code buttons until Pacer is updated.
 - Usage estimates are rough and cover the 5-hour limit only, not the weekly one.
-- Less tested so far: the **Browse…** folder picker, the last step of the VS Code buttons (the Claude panel showing the conversation), and pull requests from separate copies against a real GitHub repository.
+- Less tested so far, on every system: the last step of the VS Code buttons (the Claude panel showing the conversation), and pull requests from separate copies against a real GitHub repository.
 
 ## Tests
 
@@ -273,7 +271,9 @@ In a session you can simply say "pick up T12 from Pacer".
 npm test
 ```
 
-This starts Pacer on a spare port with a throwaway data folder and checks that it serves the page, refuses requests from other websites, and stores projects and tasks. It never starts a real agent.
+This starts Pacer on a spare port with a throwaway data folder and checks that it serves the page, refuses requests from other websites, stores projects and tasks, finds `claude` on PATH, and starts, finishes and stops an agent. The agent is a stand-in (`test/fake-claude.js`), so no real agent runs and nothing is spent.
+
+GitHub Actions runs the same tests on Windows (Node 20 and 22) and Linux on every push: see `.github/workflows/test.yml`.
 
 ## Files
 
@@ -283,7 +283,8 @@ This starts Pacer on a spare port with a throwaway data folder and checks that i
 | `public/` | The page you see in the browser |
 | `dash.js` | Command-line helper for Claude sessions |
 | `guard/` | The no-commit checks used during agent runs |
-| `test/` | Tests (`npm test`) |
+| `test/` | Tests (`npm test`) and the stand-in agent they use |
+| `start.command`, `start.cmd` | Double-click starters for macOS and Windows |
 | `data/db.json` | Your projects and tasks (created on first start) |
 | `data/runs/` | The raw output of every agent run, one file per task |
 | `data/changes/` | The recorded changes of each task, as patch files |

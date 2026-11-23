@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, node: 20 }
+          - { os: windows-latest, node: 22 }
+          - { os: ubuntu-latest, node: 22 }
+          # macOS is left out on purpose: the tests run on the Mac during
+          # development, and macOS minutes cost 10x on private repositories.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test

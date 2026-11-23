@@ -154,7 +154,7 @@ function md(source) {
 
 // ---------------------------------------------------------------- theme
 
-// The page follows this Mac's light or dark setting until you choose one.
+// The page follows this computer's light or dark setting until you choose one.
 const ICON_SUN = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="3.6"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg>';
 const ICON_MOON = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M16.5 12.2A7 7 0 0 1 7.8 3.5a7 7 0 1 0 8.7 8.7z"/></svg>';
 const themeChoice = () => { try { return localStorage.getItem('dash.theme') || ''; } catch { return ''; } };
@@ -196,6 +196,8 @@ const MODEL_NAME = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus', fable: 'Fab
 // not restarted yet): the new features stay hidden until the restart.
 const PAGE_VERSION = 10;
 const serverHas = (n) => (S.meta.version || 1) >= n;
+// The name of the file manager on the computer the server runs on.
+const filesApp = () => ({ darwin: 'Finder', win32: 'File Explorer' })[S.meta.platform || 'darwin'] || 'the file manager';
 const v2 = () => serverHas(2);
 
 // How careful agents are with your Claude limit.
@@ -319,7 +321,7 @@ function setProjSort(v) {
   $('#proj-sort').value = v;
   renderProjects();
 }
-// "Opened" = picked in the side list, or opened in Finder / VS Code.
+// "Opened" = picked in the side list, or opened in the file manager / VS Code.
 function noteOpened(pid) {
   const all = readJSON('dash.opened', {});
   all[pid] = { at: Date.now(), n: ((all[pid] && all[pid].n) || 0) + 1 };
@@ -567,7 +569,7 @@ function renderBoard() {
   if (!S.projects.length) {
     board.replaceChildren(h('div', { class: 'welcome' },
       h('h3', null, 'Link your project folders to begin'),
-      h('p', null, 'A project is just a folder on this Mac. Once it is linked you can add tasks for it, start agents on them, and watch their progress here. Linking never changes or moves the folder.'),
+      h('p', null, 'A project is just a folder on this computer. Once it is linked you can add tasks for it, start agents on them, and watch their progress here. Linking never changes or moves the folder.'),
       h('div', { class: 'btns' },
         S.meta.suggestRoot && h('button', { class: 'btn primary', onclick: () => linkDialog(S.meta.suggestRoot, true) }, `Find projects in ${S.meta.suggestRoot.replace(S.meta.home, '~')}`),
         h('button', { class: 'btn', onclick: () => linkDialog() }, 'Link one folder'))));
@@ -1274,7 +1276,7 @@ function convoPanel(opts = {}) {
   return panel;
 }
 
-// How many agents may run at once, with plain advice about this Mac. The user
+// How many agents may run at once, with plain advice about this computer. The user
 // decides; the advice only says what to expect.
 function agentLimit(onchange) {
   const sys = S.meta.system || { memGb: 8, cores: 4 };
@@ -1291,10 +1293,10 @@ function agentLimit(onchange) {
     let need = reserve;
     for (let k = 0; k < n; k++) need += weights[k] || 0.5;
     const heavyN = weights.slice(0, n).filter((w) => w === 3).length;
-    const base = `This Mac has ${sys.memGb} GB of memory and ${sys.cores} cores. An agent building an Android app needs about 3 GB; a web or plan-only agent about 1 GB or less. Comfortable here: up to ${heavyMax} with Android builds, up to ${lightMax} for light work.`;
+    const base = `This computer has ${sys.memGb} GB of memory and ${sys.cores} cores. An agent building an Android app needs about 3 GB; a web or plan-only agent about 1 GB or less. Comfortable here: up to ${heavyMax} with Android builds, up to ${lightMax} for light work.`;
     const worst = `${n} at once on your heaviest projects${heavyN ? ` (${heavyN} Android)` : ''} could need about ${Math.round(need)} GB with your other apps.`;
     note.className = `hint${need > sys.memGb ? ' warn-text' : ''}`;
-    note.textContent = `${base} ${worst} ${need > sys.memGb ? 'That is more than this Mac has, so expect slow or failed builds. It is your call.' : 'That should fit.'}`;
+    note.textContent = `${base} ${worst} ${need > sys.memGb ? 'That is more than this computer has, so expect slow or failed builds. It is your call.' : 'That should fit.'}`;
   }
   verdict();
   return { pick, note, get value() { return Number(pick.value); } };
@@ -1540,7 +1542,7 @@ function bulkDialog() {
 }
 
 function linkDialog(startPath, scanNow) {
-  const input = h('input', { type: 'text', placeholder: '/Users/you/Projects/MyApp', value: startPath || '', spellcheck: false });
+  const input = h('input', { type: 'text', placeholder: S.meta.platform === 'win32' ? 'C:\\Users\\you\\Projects\\MyApp' : '/Users/you/Projects/MyApp', value: startPath || '', spellcheck: false });
   const results = h('div');
   let found = [];
 
@@ -1589,7 +1591,7 @@ function linkDialog(startPath, scanNow) {
   } }, 'Browse…');
 
   showDialog('Link a project folder', [
-    field('Folder on this Mac', h('div', { class: 'path-row' }, input, browse)),
+    field('Folder on this computer', h('div', { class: 'path-row' }, input, browse)),
     h('div', { style: 'display:flex; gap:8px; flex-wrap:wrap' },
       h('button', { class: 'btn primary', onclick: () => linkPaths([input.value]) }, 'Link this folder'),
       h('button', { class: 'btn', onclick: scan }, 'Find projects inside it')),
@@ -1648,7 +1650,7 @@ function projectDialog(pid) {
     h('dl', { class: 'kv' }, facts.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
     h('div', { style: 'display:flex; gap:8px; flex-wrap:wrap' },
       h('button', { class: 'btn small', onclick: () => conversationsDialog(p.id) }, 'Conversations'),
-      h('button', { class: 'btn small', onclick: () => { noteOpened(p.id); api('POST', `/api/projects/${p.id}/open`, { app: 'finder' }); } }, 'Open in Finder'),
+      h('button', { class: 'btn small', onclick: () => { noteOpened(p.id); api('POST', `/api/projects/${p.id}/open`, { app: 'finder' }); } }, `Open in ${filesApp()}`),
       h('button', { class: 'btn small', onclick: () => { noteOpened(p.id); api('POST', `/api/projects/${p.id}/open`, { app: 'vscode' }); } }, 'Open in VS Code')),
     field('Name', name),
     field('Folder', folder),
@@ -1678,12 +1680,12 @@ function settingsDialog() {
   const model = select(modelOptions(true), S.settings.defaultModel || '', () => {});
   const autoMax = select(TIERS.map((x) => [x[0], modelLabel(x[2])]), S.settings.autoMax || 'max', () => {});
   const bin = h('input', { type: 'text', value: S.settings.claudePath || '', placeholder: S.meta.claude || 'Not found: paste the full path', spellcheck: false });
-  const theme = select([['', 'Same as this Mac'], ['light', 'Light'], ['dark', 'Dark']], themeChoice(), (v) => setTheme(v));
+  const theme = select([['', 'Same as this computer'], ['light', 'Light'], ['dark', 'Dark']], themeChoice(), (v) => setTheme(v));
   const notifyBox = h('input', { type: 'checkbox', checked: S.settings.notify !== false });
   const ntfy = h('input', { type: 'text', value: S.settings.ntfyTopic || '', placeholder: 'Empty: no phone notifications', spellcheck: false });
   showDialog('Settings', [
     field('Theme', theme),
-    serverHas(7) && h('label', { class: 'cp-link' }, notifyBox, 'Show a Mac notification when a task finishes, needs your OK, or the limit runs out'),
+    serverHas(7) && h('label', { class: 'cp-link' }, notifyBox, 'Show a desktop notification when a task finishes, needs your OK, or the limit runs out'),
     serverHas(7) && field('Phone notifications: your topic name on ntfy.sh', ntfy),
     serverHas(7) && h('p', { class: 'hint' }, 'For the phone, install the free ntfy app, subscribe to a topic name only you know, and type it here. The task id, project name and title are then sent to ntfy.sh, an outside service.'),
     field('Agents running at the same time', max),
@@ -1713,7 +1715,7 @@ async function conversationsDialog(pid, linkTo) {
   const body = h('div', null, h('p', { class: 'hint' }, 'Reading saved conversations…'));
   showDialog(linkTo ? `Link a conversation to ${linkTo}` : `Conversations in ${p.name}`, [
     body,
-    h('p', { class: 'hint' }, 'These are the Claude Code conversations saved on this Mac for this folder. Claude removes them after about 30 days. Chats on claude.ai are not stored here.'),
+    h('p', { class: 'hint' }, 'These are the Claude Code conversations saved on this computer for this folder. Claude removes them after about 30 days. Chats on claude.ai are not stored here.'),
   ], [h('button', { class: 'btn ghost', onclick: closeDialog }, 'Close')]);
   $('#dlg').style.width = 'min(680px, calc(100vw - 32px))';
   let r;
@@ -1738,7 +1740,7 @@ async function conversationReader(sessionId, back) {
   showDialog('Conversation', [body], foot);
   $('#dlg').style.width = 'min(820px, calc(100vw - 32px))';
   let c;
-  try { c = await api('GET', `/api/conversations/${sessionId}`); } catch { body.replaceChildren(h('p', { class: 'hint' }, 'This conversation is no longer saved on this Mac.')); return; }
+  try { c = await api('GET', `/api/conversations/${sessionId}`); } catch { body.replaceChildren(h('p', { class: 'hint' }, 'This conversation is no longer saved on this computer.')); return; }
   $('#dlg .dlg-head').textContent = c.title;
   const nodes = [h('p', { class: 'hint' }, [
     c.startedAt ? `Started ${new Date(c.startedAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false })}` : null,
@@ -1815,7 +1817,7 @@ function spendChart(days) {
     h('div', { class: 'chart-x' }, h('span', null, dayLabel(days[0].at)), h('span', null, dayLabel(days[7].at)), h('span', null, 'Today')));
 }
 
-// Asks before anything leaves this Mac: the dashboard commits the copy's
+// Asks before anything leaves this computer: the dashboard commits the copy's
 // changes as you, pushes the branch and opens the pull request.
 function pullRequestDialog(t) {
   const title = h('input', { type: 'text', value: t.title });

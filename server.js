@@ -7,6 +7,8 @@
  *   node server.js        then open http://localhost:4577
  *
  * It listens on 127.0.0.1 only. Data lives in ./data/db.json.
+ * Runs on macOS, Windows and Linux; a few extras (notifications, the folder
+ * picker, open in VS Code) use each system's own tools.
  */
 const http = require('node:http');
 const fs = require('node:fs');
@@ -17,6 +19,8 @@ const { spawn, execFile } = require('node:child_process');
 
 const PORT = Number(process.env.DASH_PORT) || 4577;
 const HOST = '127.0.0.1';
+const WIN = process.platform === 'win32';
+const MAC = process.platform === 'darwin';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DATA_DIR = process.env.DASH_DATA || path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
@@ -151,7 +155,7 @@ function briefTask(t) {
 
 function sh(cmd, args, opts = {}) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: 5000, maxBuffer: 4e6, ...opts }, (err, stdout, stderr) => {
+    execFile(cmd, args, { timeout: 5000, maxBuffer: 4e6, windowsHide: true, ...opts }, (err, stdout, stderr) => {
       resolve({ ok: !err, out: String(stdout || ''), err: String(stderr || ''), code: err ? err.code : 0 });
     });
   });
@@ -496,7 +500,7 @@ function taskConversations(t) {
   return ids.map((id) => {
     const kind = id === t.sessionId ? 'agent' : 'linked';
     const file = findSessionFile(id, p && p.path);
-    if (!file) return { id, kind, missing: true, title: 'Conversation no longer saved on this Mac' };
+    if (!file) return { id, kind, missing: true, title: 'Conversation no longer saved on this computer' };
     try { return { ...sessionSummary(file), kind }; } catch { return { id, kind, missing: true, title: 'Conversation could not be read' }; }
   });
 }
@@ -514,8 +518,42 @@ function linkConversation(t, id) {
 // The Claude extension keeps one small file here per open VS Code window,
 // naming the folder that window has open.
 const IDE_LOCKS = path.join(os.homedir(), '.claude', 'ide');
-const VSCODE = ['-a', 'Visual Studio Code'];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Windows paths compare without regard to case (C:\ and c:\ are one folder).
+const samePath = (a, b) => (WIN ? a.toLowerCase() === b.toLowerCase() : a === b);
+
+// Opens a link (such as vscode://…) with whatever program handles it.
+function openLink(url) {
+  if (MAC) return sh('open', [url]);
+  if (WIN) return sh('rundll32', ['url.dll,FileProtocolHandler', url]);
+  return sh('xdg-open', [url]);
+}
+
+// Opens a folder in Finder, File Explorer or the Linux file manager.
+async function openFolder(dir) {
+  if (MAC) return sh('open', [dir]);
+  // Explorer exits with code 1 even when it worked, so its result says nothing.
+  if (WIN) { await sh('explorer.exe', [dir]); return { ok: true, out: '', err: '' }; }
+  return sh('xdg-open', [dir]);
+}
+
+// Opens a folder, or a vscode:// link, in VS Code.
+function openInVSCode(target) {
+  if (MAC) return sh('open', ['-a', 'Visual Studio Code', target]);
+  if (/^vscode:/.test(target)) return openLink(target);
+  if (WIN) {
+    const exe = [
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Microsoft VS Code', 'Code.exe'),
+      path.join(process.env.ProgramFiles || '', 'Microsoft VS Code', 'Code.exe'),
+    ].find((f) => fs.existsSync(f));
+    if (!exe) return openLink(`vscode://file/${target.replace(/\\/g, '/')}`);
+    try {
+      spawn(exe, [target], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      return Promise.resolve({ ok: true, out: '', err: '' });
+    } catch (e) { return Promise.resolve({ ok: false, out: '', err: e.message }); }
+  }
+  return sh('code', [target]);
+}
 
 function vscodeHasFolder(dir) {
   let names = [];
@@ -525,7 +563,7 @@ function vscodeHasFolder(dir) {
     try {
       const lock = JSON.parse(fs.readFileSync(path.join(IDE_LOCKS, name), 'utf8'));
       if (lock.ideName && !/visual studio code/i.test(lock.ideName)) continue;
-      if (!(lock.workspaceFolders || []).some((f) => fs.realpathSync(f) === dir)) continue;
+      if (!(lock.workspaceFolders || []).some((f) => samePath(fs.realpathSync(f), dir))) continue;
       if (lock.pid) process.kill(lock.pid, 0); // throws when that VS Code is gone
       return true;
     } catch { /* a leftover or unreadable file */ }
@@ -540,18 +578,18 @@ function vscodeHasFolder(dir) {
 // to the front once more, and only then send the link. Gives false when the
 // window never showed up in time (the link is still sent, as a best effort).
 async function openClaudeInVSCode(dir, query) {
-  const first = await sh('open', [...VSCODE, dir]);
-  if (!first.ok) throw new HttpError(500, 'Could not open VS Code. Is it installed in Applications?');
+  const first = await openInVSCode(dir);
+  if (!first.ok) throw new HttpError(500, 'Could not open VS Code. Is it installed?');
   const until = Date.now() + 25000;
   let up = vscodeHasFolder(dir);
   while (!up && Date.now() < until) {
     await sleep(500);
     up = vscodeHasFolder(dir);
   }
-  await sh('open', [...VSCODE, dir]);
+  await openInVSCode(dir);
   await sleep(700);
   const link = `vscode://anthropic.claude-code/open?${new URLSearchParams(query)}`;
-  const sent = await sh('open', [...VSCODE, link]);
+  const sent = await openInVSCode(link);
   if (!sent.ok) throw new HttpError(500, 'VS Code opened, but its Claude panel did not. Is the Claude Code extension installed?');
   return up;
 }
@@ -661,7 +699,7 @@ function classifyTask(t, p, bin) {
     ].filter(Boolean).join('\n');
     let child;
     try {
-      child = execFile(bin, args, { cwd: os.tmpdir(), env: agentEnv(), timeout: 40000, maxBuffer: 4e6 }, (err, stdout) => {
+      child = execFile(...claudeCommand(bin, args), { cwd: os.tmpdir(), env: agentEnv(), timeout: 40000, maxBuffer: 4e6, windowsHide: true }, (err, stdout) => {
         let r = null;
         try { r = JSON.parse(String(stdout)); } catch { /* no answer */ }
         if (Array.isArray(r)) r = r[r.length - 1];
@@ -1032,7 +1070,7 @@ function refreshLimits() {
       '--output-format', 'stream-json', '--verbose', '--no-session-persistence'];
     let child;
     try {
-      child = execFile(bin, args, { cwd: os.tmpdir(), env: agentEnv(), timeout: 40000, maxBuffer: 4e6 }, (err, stdout) => {
+      child = execFile(...claudeCommand(bin, args), { cwd: os.tmpdir(), env: agentEnv(), timeout: 40000, maxBuffer: 4e6, windowsHide: true }, (err, stdout) => {
         let got = false;
         for (const line of String(stdout).split('\n')) {
           let ev;
@@ -1180,7 +1218,7 @@ function readSuggestions(obj, run) {
 
 // ---------------------------------------------------------------- notifications
 
-// A Mac notification (and a phone one through ntfy.sh, if you set a topic)
+// A desktop notification (and a phone one through ntfy.sh, if you set a topic)
 // when something needs you. Several at once are folded into one.
 const notes = [];
 let noteTimer = null;
@@ -1189,12 +1227,31 @@ function notify(textLine) {
   notes.push(textLine);
   if (!noteTimer) noteTimer = setTimeout(sendNotes, 2500);
 }
+function desktopNote(line) {
+  const quiet = () => {};
+  if (MAC) return execFile('osascript', ['-e', `display notification ${JSON.stringify(line)} with title "Pacer"`], quiet);
+  if (WIN) {
+    // A tray balloon, which Windows 10 and 11 show as a normal notification.
+    // The text goes in through the environment, so no quoting can break it.
+    return execFile('powershell.exe', ['-NoProfile', '-Command', [
+      'Add-Type -AssemblyName System.Windows.Forms, System.Drawing',
+      '$n = New-Object System.Windows.Forms.NotifyIcon',
+      '$n.Icon = [System.Drawing.SystemIcons]::Information',
+      '$n.Visible = $true',
+      "$n.ShowBalloonTip(8000, 'Pacer', $env:PACER_NOTE, 'None')",
+      'Start-Sleep -Seconds 8',
+      '$n.Dispose()',
+    ].join('; ')], { windowsHide: true, timeout: 20000, env: { ...process.env, PACER_NOTE: line } }, quiet);
+  }
+  return execFile('notify-send', ['Pacer', line], quiet);
+}
+
 function sendNotes() {
   noteTimer = null;
   const list = notes.splice(0);
   if (!list.length) return;
   const body = list.length === 1 ? list[0] : `${list.length} updates. ${list.slice(0, 3).join(' · ')}${list.length > 3 ? ' · …' : ''}`;
-  execFile('osascript', ['-e', `display notification ${JSON.stringify(body.slice(0, 300))} with title "Pacer"`], () => {});
+  desktopNote(body.slice(0, 300));
   const topic = db.settings.ntfyTopic;
   if (topic) fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, { method: 'POST', body, headers: { Title: 'Pacer' } }).catch(() => {});
 }
@@ -1253,29 +1310,45 @@ function findClaude() {
   const home = os.homedir();
   const cands = [];
   if (db.settings.claudePath) cands.push(db.settings.claudePath);
-  for (const d of (process.env.PATH || '').split(':')) if (d) cands.push(path.join(d, 'claude'));
-  cands.push(
-    path.join(home, '.claude/local/claude'),
-    path.join(home, '.local/bin/claude'),
-    '/opt/homebrew/bin/claude',
-    '/usr/local/bin/claude',
-  );
+  // On Windows the program is claude.exe, or claude.cmd when npm installed it.
+  const names = WIN ? ['claude.exe', 'claude.cmd'] : ['claude'];
+  for (const d of (process.env.PATH || '').split(path.delimiter)) if (d) for (const n of names) cands.push(path.join(d, n));
+  for (const n of names) cands.push(path.join(home, '.local', 'bin', n), path.join(home, '.claude', 'local', n));
+  if (WIN && process.env.APPDATA) cands.push(path.join(process.env.APPDATA, 'npm', 'claude.cmd'));
+  if (!WIN) cands.push('/opt/homebrew/bin/claude', '/usr/local/bin/claude');
   // The VS Code extension ships the same program. Newest version first.
-  const ext = path.join(home, '.vscode/extensions');
+  const ext = path.join(home, '.vscode', 'extensions');
   try {
     const dirs = fs.readdirSync(ext)
       .filter((n) => n.startsWith('anthropic.claude-code-'))
       .sort((a, b) => versionKey(b) - versionKey(a));
-    for (const d of dirs) cands.push(path.join(ext, d, 'resources/native-binary/claude'));
+    for (const d of dirs) cands.push(path.join(ext, d, 'resources', 'native-binary', WIN ? 'claude.exe' : 'claude'));
   } catch { /* no VS Code */ }
   for (const c of cands) {
-    try {
-      fs.accessSync(c, fs.constants.X_OK);
-      if (fs.statSync(c).isFile()) return c;
-    } catch { /* keep looking */ }
+    const found = runnableClaude(c);
+    if (found) return found;
   }
   return null;
 }
+
+// A file Pacer can start directly. A Windows .cmd/.bat cannot be started
+// without a shell (and quoting long prompts through cmd.exe is fragile), so
+// for npm's claude.cmd the real program inside the npm package is used.
+function runnableClaude(c) {
+  try {
+    if (!fs.statSync(c).isFile()) return null;
+    if (/\.(cmd|bat)$/i.test(c)) {
+      const pkg = path.join(path.dirname(c), 'node_modules', '@anthropic-ai', 'claude-code');
+      for (const f of [path.join(pkg, 'bin', 'claude.exe'), path.join(pkg, 'cli.js')]) if (fs.existsSync(f)) return f;
+      return null;
+    }
+    if (!WIN && !/\.[cm]?js$/i.test(c)) fs.accessSync(c, fs.constants.X_OK); // a .js file runs through Node
+    return c;
+  } catch { return null; }
+}
+
+// The command and arguments that start claude. A .js file runs through Node.
+const claudeCommand = (bin, args) => (/\.[cm]?js$/i.test(bin) ? [process.execPath, [bin, ...args]] : [bin, args]);
 
 function systemPrompt(t) {
   if (t.kind === 'scan') {
@@ -1429,7 +1502,7 @@ function launchAgent(t, p, st, bin, resume, followUp) {
   // before every shell command, git hooks that refuse inside git itself, and
   // the plain deny rules.
   args.push('--settings', JSON.stringify({
-    hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `"${process.execPath}" "${GUARD}"` }] }] },
+    hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `"${process.execPath.replace(/\\/g, '/')}" "${GUARD.replace(/\\/g, '/')}"` }] }] },
   }));
   args.push('--disallowedTools', 'Bash(git commit *)', 'Bash(git push *)');
 
@@ -1445,7 +1518,8 @@ function launchAgent(t, p, st, bin, resume, followUp) {
 
   let child;
   try {
-    child = spawn(bin, args, { cwd: workDir(t, p), env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    // Its own process group (not on Windows), so Stop can end everything it started.
+    child = spawn(...claudeCommand(bin, args), { cwd: workDir(t, p), env, stdio: ['pipe', 'pipe', 'pipe'], detached: !WIN, windowsHide: true });
   } catch (e) {
     st.done = true;
     return finish(t, 'failed', `Could not start the agent: ${e.message}`);
@@ -1554,6 +1628,11 @@ function killAgent(st) {
   st.stopped = true;
   if (!st.child) return; // still preparing: it stops before it launches
   const pid = st.child.pid;
+  if (WIN) {
+    // No process groups or signals on Windows: end the whole process tree.
+    if (pid) execFile('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }, () => {});
+    return;
+  }
   const signal = (sig) => {
     try { process.kill(-pid, sig); } catch { try { st.child.kill(sig); } catch { /* gone */ } }
   };
@@ -1567,7 +1646,7 @@ function setWait(t, reason) {
 
 const sizing = new Set(); // ids of tasks whose Auto pick is being made
 // Each check is a Claude process of about 200 MB. With many tasks queued at
-// once, all of them at the same moment would use up this Mac's memory.
+// once, all of them at the same moment would use up this computer's memory.
 const SIZING_MAX = 3;
 let pumpTimer = null;
 function pumpSoon() {
@@ -1746,7 +1825,7 @@ const api = {
       tasks: db.tasks.map(briefTask),
       usage: usage(),
       forecast: forecast(),
-      meta: { version: API_VERSION, claude: findClaude(), running: running.size, suggestRoot: path.dirname(__dirname), home: os.homedir(),
+      meta: { version: API_VERSION, platform: process.platform, claude: findClaude(), running: running.size, suggestRoot: path.dirname(__dirname), home: os.homedir(),
         system: { memGb: Math.round(os.totalmem() / 2 ** 30), cores: os.cpus().length } },
     };
   },
@@ -1774,7 +1853,7 @@ const api = {
 
   getConversation(req, res, m) {
     const file = findSessionFile(m[1]);
-    if (!file) throw new HttpError(404, 'That conversation is no longer saved on this Mac.');
+    if (!file) throw new HttpError(404, 'That conversation is no longer saved on this computer.');
     const s = parseSession(file);
     const max = 3000;
     return { ...sessionSummary(file), items: s.items.slice(-max), cut: Math.max(0, s.items.length - max) };
@@ -1962,7 +2041,7 @@ const api = {
       const id = String(body.sessionId || '');
       if (!SESSION_ID.test(id)) throw new HttpError(400, 'That is not a conversation id.');
       if (action === 'link') {
-        if (!findSessionFile(id)) throw new HttpError(404, 'That conversation is not saved on this Mac.');
+        if (!findSessionFile(id)) throw new HttpError(404, 'That conversation is not saved on this computer.');
         if (linkConversation(t, id)) addLog(t, 'status', 'Conversation linked');
       } else {
         t.conversations = (t.conversations || []).filter((x) => x !== id);
@@ -2114,19 +2193,33 @@ const api = {
   async openProject(req, res, m, body) {
     const p = findProject(m[1]);
     if (!p) throw new HttpError(404, 'That project is no longer linked.');
-    const args = body.app === 'vscode' ? ['-a', 'Visual Studio Code', p.path] : [p.path];
-    const r = await sh('open', args);
+    const r = body.app === 'vscode' ? await openInVSCode(p.path) : await openFolder(p.path);
     if (!r.ok) throw new HttpError(500, r.err.trim() || 'Could not open the folder.');
     return { ok: true };
   },
 
   async pickFolder() {
-    const r = await sh('osascript', [
-      '-e', 'tell me to activate',
-      '-e', 'POSIX path of (choose folder with prompt "Choose a project folder")',
-    ], { timeout: 180000 });
-    if (!r.ok) return { cancelled: true };
-    return { path: r.out.trim().replace(/\/$/, '') };
+    let r;
+    if (MAC) {
+      r = await sh('osascript', [
+        '-e', 'tell me to activate',
+        '-e', 'POSIX path of (choose folder with prompt "Choose a project folder")',
+      ], { timeout: 180000 });
+    } else if (WIN) {
+      // A hidden always-on-top window owns the dialog, so it opens in front of the browser.
+      r = await sh('powershell.exe', ['-NoProfile', '-STA', '-Command', [
+        'Add-Type -AssemblyName System.Windows.Forms',
+        '$o = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }',
+        '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+        "$d.Description = 'Choose a project folder'",
+        "if ($d.ShowDialog($o) -eq 'OK') { $d.SelectedPath }",
+      ].join('; ')], { timeout: 180000 });
+    } else {
+      r = await sh('zenity', ['--file-selection', '--directory', '--title=Choose a project folder'], { timeout: 180000 });
+    }
+    const dir = r.ok ? r.out.trim() : '';
+    if (!dir) return { cancelled: true };
+    return { path: dir.length > 1 ? dir.replace(/[\\/]$/, '') : dir };
   },
 
   scan(req, res, m, body) {
@@ -2223,7 +2316,7 @@ const api = {
       // The agent's own conversation, else the newest one linked to the task.
       const saved = (id) => fs.existsSync(path.join(sessionDir(workDir(t, p)), `${id}.jsonl`));
       const sid = [t.sessionId, ...(t.conversations || []).slice().reverse()].find((id) => id && saved(id));
-      if (!sid) throw new HttpError(409, 'This task has no conversation saved on this Mac any more. Use "Start in VS Code" instead.');
+      if (!sid) throw new HttpError(409, 'This task has no conversation saved on this computer any more. Use "Start in VS Code" instead.');
       const up = await openClaudeInVSCode(workDir(t, p), { session: sid });
       if (!mine && !agentBusy(t)) {
         // While you work on it by hand, the dashboard must not run its own
@@ -2452,8 +2545,10 @@ process.on('SIGTERM', shutdown);
 
 server.on('error', (e) => {
   if (e.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. The dashboard is probably already running: http://localhost:${PORT}`);
-    process.exit(0);
+    console.error(`Port ${PORT} is already in use. Pacer is probably already running: http://localhost:${PORT}`);
+    if (process.argv.includes('--open')) openLink(`http://localhost:${PORT}`).then(() => process.exit(0));
+    else process.exit(0);
+    return;
   }
   throw e;
 });
@@ -2461,7 +2556,7 @@ server.on('error', (e) => {
 load();
 server.listen(PORT, HOST, () => {
   console.log(`Pacer is running: http://localhost:${PORT}`);
-  if (process.platform !== 'darwin') console.log('Note: Pacer is built for macOS. Notifications, the folder picker and the Finder buttons will not work here.');
+  if (process.argv.includes('--open')) openLink(`http://localhost:${PORT}`);
   console.log(`Data: ${DB_FILE}`);
   console.log(findClaude() ? `Agents use: ${findClaude()}` : 'Warning: the claude program was not found. Set its path in Settings.');
 });

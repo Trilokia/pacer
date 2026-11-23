@@ -1,6 +1,7 @@
 'use strict';
 // Starts Pacer on a spare port with a throwaway data folder. No real agent is
-// ever started: Settings point at a fake `claude` that only prints one line.
+// ever started: Settings point at test/fake-claude.js, which only pretends.
+// These tests run on macOS, Windows and Linux (see .github/workflows).
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
@@ -12,8 +13,12 @@ const path = require('node:path');
 const ROOT = path.join(__dirname, '..');
 const PORT = 45000 + Math.floor(Math.random() * 5000);
 const HOST = `127.0.0.1:${PORT}`;
+const WIN = process.platform === 'win32';
+const FAKE = path.join(__dirname, 'fake-claude.js');
 let tmp;
 let server;
+let pidFile;
+let onPath; // where the server should find claude on PATH
 
 function request(method, pathname, { body, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
@@ -38,11 +43,25 @@ function request(method, pathname, { body, headers = {} } = {}) {
 
 before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pacer-test-'));
-  const fake = path.join(tmp, 'claude');
-  fs.writeFileSync(fake, '#!/bin/sh\necho \'{"type":"result","subtype":"success","result":"ok","total_cost_usd":0}\'\n', { mode: 0o755 });
   fs.mkdirSync(path.join(tmp, 'WeatherApp'));
+  pidFile = path.join(tmp, 'pids.txt');
+  // A claude for the server to find on PATH: on Windows the claude.cmd that
+  // npm makes (Pacer runs the package's cli.js instead), elsewhere a plain file.
+  const bin = path.join(tmp, 'bin');
+  fs.mkdirSync(bin);
+  if (WIN) {
+    fs.writeFileSync(path.join(bin, 'claude.cmd'), '@echo off\r\n');
+    const pkg = path.join(bin, 'node_modules', '@anthropic-ai', 'claude-code');
+    fs.mkdirSync(pkg, { recursive: true });
+    onPath = path.join(pkg, 'cli.js');
+    fs.copyFileSync(FAKE, onPath);
+  } else {
+    onPath = path.join(bin, 'claude');
+    fs.writeFileSync(onPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  }
+  const PATH = [bin, WIN ? process.env.PATH : '/usr/bin:/bin'].join(path.delimiter);
   server = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
-    env: { ...process.env, DASH_PORT: String(PORT), DASH_DATA: path.join(tmp, 'data'), PATH: '/usr/bin:/bin' },
+    env: { ...process.env, DASH_PORT: String(PORT), DASH_DATA: path.join(tmp, 'data'), PATH, Path: PATH, PACER_TEST_PIDS: pidFile },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await new Promise((resolve, reject) => {
@@ -55,13 +74,34 @@ before(async () => {
     server.stderr.on('data', (c) => { out += c; });
     server.on('exit', (code) => reject(new Error(`Server exited (${code}):\n${out}`)));
   });
-  const r = await request('PATCH', '/api/settings', { body: { claudePath: fake } });
+  const r = await request('PATCH', '/api/settings', { body: { claudePath: FAKE, notify: false } });
   assert.equal(r.status, 200, r.text);
 });
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(what, check, ms = 15000) {
+  const until = Date.now() + ms;
+  for (;;) {
+    const v = await check();
+    if (v) return v;
+    if (Date.now() > until) throw new Error(`Timed out waiting for: ${what}`);
+    await sleep(150);
+  }
+}
+const getTask = async (id) => (await request('GET', `/api/tasks/${id}`)).json;
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
 after(() => {
   if (server) server.kill();
-  if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+  if (tmp) try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* Windows may still hold a file */ }
+});
+
+test('finds claude on PATH when no path is set', async () => {
+  await request('PATCH', '/api/settings', { body: { claudePath: '' } });
+  const state = await request('GET', '/api/state');
+  assert.equal(state.json.meta.claude, onPath);
+  assert.equal(state.json.meta.platform, process.platform);
+  await request('PATCH', '/api/settings', { body: { claudePath: FAKE } });
 });
 
 test('serves the page', async () => {
@@ -115,6 +155,39 @@ test('links a project and stores a plan-only task', async () => {
   assert.ok(task, 'the new task is in the state');
   assert.equal(task.mode, 'plan');
   assert.ok(fs.existsSync(path.join(tmp, 'data', 'db.json')), 'data is saved to disk');
+});
+
+test('runs an agent and shows its result for review', async () => {
+  const state = await request('GET', '/api/state');
+  const project = state.json.projects.find((p) => p.name === 'WeatherApp');
+  const made = await request('POST', '/api/tasks', { body: { projectId: project.id, title: 'Quick check' } });
+  const run = await request('POST', `/api/tasks/${made.json.id}/run`, { body: {} });
+  assert.equal(run.status, 200, run.text);
+  const t = await waitFor('the task to finish', async () => {
+    const x = await getTask(made.json.id);
+    return x && x.status === 'review' && x;
+  });
+  assert.equal(t.outcome, 'ok', JSON.stringify(t.log || t));
+});
+
+test('Stop ends the agent and everything it started', async () => {
+  const state = await request('GET', '/api/state');
+  const project = state.json.projects.find((p) => p.name === 'WeatherApp');
+  const made = await request('POST', '/api/tasks', { body: { projectId: project.id, title: 'KEEP RUNNING until stopped' } });
+  await request('POST', `/api/tasks/${made.json.id}/run`, { body: {} });
+  const pids = await waitFor('the agent to start', () => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim().split(' ').map(Number));
+  assert.equal(pids.length, 2);
+  assert.ok(pids.every(alive), 'the agent and its child are running');
+  assert.equal((await getTask(made.json.id)).status, 'running');
+
+  const stop = await request('POST', `/api/tasks/${made.json.id}/stop`, { body: {} });
+  assert.equal(stop.status, 200, stop.text);
+  const t = await waitFor('the task to stop', async () => {
+    const x = await getTask(made.json.id);
+    return x && x.status === 'review' && x;
+  });
+  assert.equal(t.outcome, 'stopped');
+  await waitFor('both processes to end', () => !pids.some(alive), 10000);
 });
 
 test('a task needs a title and a project', async () => {

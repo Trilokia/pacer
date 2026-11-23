@@ -1,6 +1,6 @@
 # Pacer
 
-A task board for all your projects that runs on your own computer (macOS, Windows or Linux). You link project folders, add tasks, and either let Pacer start Claude Code agents on them or let your own Claude sessions in VS Code pick them up. It paces the agents against your Claude plan limits, so a long queue finishes whole projects instead of leaving every project half done when the limit runs out. Progress and final reports show up on the board.
+A task board for all your projects that runs on your own computer (macOS, Windows or Linux). You link project folders, add tasks, and either let Pacer start Claude Code agents on them or let your own Claude sessions in VS Code pick them up. It paces the agents against your Claude plan limits, so a long queue finishes whole projects instead of leaving every project half done when the limit runs out. Progress and final reports show up on the board. Flowcharts in [How Pacer decides](#how-pacer-decides) show when tasks start, which model they use and what happens when a run ends.
 
 Pacer is a small web app: a Node server on your computer, and a page you open in your browser. It needs only Node (no `npm install`). It listens on your computer only and is not reachable from the network. It runs on your computer rather than as a website because it starts `claude` in your project folders.
 
@@ -241,6 +241,84 @@ To go back to the old order (priority and time only, projects mixed), choose "Mi
 - Agents cannot commit or push. A check runs before each of their shell commands (`guard/pre-tool.js`), and git itself refuses through hooks in `guard/githooks/` that apply only to agent runs. Your own git commands are not affected.
 - Editing agents run in Claude Code's `auto` permission mode, which blocks risky actions on its own.
 - Agents follow each project's `CLAUDE.md`, like any Claude session.
+
+## How Pacer decides
+
+These charts follow the code in `server.js` (`pump()`, `chooseModel()` and the end of `launchAgent()`).
+
+### When a waiting task starts
+
+Pacer looks at the queue whenever something changes, and at least once a minute. It tries the waiting tasks in line order: first by project (a project agents are already working on, then the one it started last, then your order from **Plan a run**, then the project that needs the least of your limit), then by priority, then by when the task was queued. Each task goes through these checks; the first "wait" it hits is the reason shown on its card.
+
+```mermaid
+flowchart TD
+    A(["A task is waiting in the queue"]) --> B{"Cut off by a limit<br/>that has not reset?"}
+    B -- yes --> W1["Wait for the reset, then continue<br/>the same conversation by itself"]
+    B -- no --> C{"Spend limit or<br/>plan limit full?"}
+    C -- yes --> W2["Paused: today's spend limit is reached, or<br/>your plan limit is past the pause level (90% by default)"]
+    C -- no --> D{"Waiting on its<br/>'Run after' task?"}
+    D -- yes --> W3["Wait until that task finishes well,<br/>or you OK its plan"]
+    D -- no --> E{"Auto model,<br/>not sized yet?"}
+    E -- yes --> S["Quick Haiku check sizes it<br/>(next chart), then try again"]
+    E -- no --> F{"All agent<br/>slots busy?"}
+    F -- yes --> W4["Wait for a free slot<br/>(Settings number; Saver 1, Balanced 2)"]
+    F -- no --> G{"Another agent<br/>editing this project?"}
+    G -- yes --> W5["Edit tasks wait: one editing agent per project<br/>(a separate copy doesn't count)"]
+    G -- no --> H{"Fits after the<br/>projects ahead?"}
+    H -- no --> W6["Wait: the project ahead finishes first, both<br/>don't fit in the free part of your 5-hour limit"]
+    H -- yes --> I{"This run fits in<br/>the free limit?"}
+    I -- no --> W7["Wait for room<br/>(Saver and Balanced, when another agent runs)"]
+    I -- yes --> GO(["Start the agent"])
+```
+
+- **Run anyway** skips every check except three: Auto sizing, the agent number in Settings, and one editing agent per project.
+- The first agent is never held by the estimate. When another agent is running, Pacer reads your limit again first if the last reading is more than 3 minutes old.
+- With "Mixed" order (in **Plan a run**) the project check is skipped and tasks go by priority and time only.
+
+### Which model a run uses
+
+```mermaid
+flowchart TD
+    A(["An agent is about to start"]) --> B{"Model set on the task?"}
+    B -- no --> C{"Default model set in Settings?"}
+    C -- no --> D{"Usage mode in force"}
+    D -- "Full power" --> CC["Claude Code's own default model"]
+    D -- "Saver or Balanced" --> SC
+    B -- yes --> X{"Is it Auto?"}
+    C -- yes --> X
+    X -- no --> FX["That model<br/>(Saver runs Fable tasks on Opus)"]
+    X -- yes --> SC{"A suggestions scan?"}
+    SC -- yes --> SS["Notes only: Efficient<br/>Notes and code: Optimized"]
+    SC -- no --> HK["Quick Haiku check of the task text<br/>(about 4 seconds, a fraction of a cent)"]
+    HK -- "no answer" --> WR["Simple word rules"]
+    HK -- answer --> CAP
+    WR --> CAP
+    SS --> CAP["Cap at 'Strongest model Auto may pick'<br/>in Settings (Saver: at most Optimized)"]
+    CAP --> T["Eco = Haiku · Efficient = Sonnet<br/>Optimized = Opus · Max = Fable"]
+```
+
+- The usage mode "in force" is the one you picked, except that Pacer acts as **Saver** while your 5-hour limit is 70% full or more (you can change this level).
+- In Saver, Haiku and Sonnet also think less, every run gets a $3 spend limit unless you set one, and an Edit task that Auto sizes as Max only plans on its first run.
+- With Auto, a follow-up keeps the model of the task's first run. If you change a task's title, details or mode, Auto sizes it again.
+
+### When a run ends
+
+```mermaid
+flowchart TD
+    A(["The agent stops"]) --> B{"You pressed Stop?"}
+    B -- yes --> R1["Needs review: stopped<br/>(what it did so far is kept)"]
+    B -- no --> C{"Cut off by your 5-hour<br/>or weekly limit?"}
+    C -- yes --> D{"Cut off more than<br/>3 times in a row?"}
+    D -- no --> Q["Back in the queue: it continues the same<br/>conversation by itself after the reset"]
+    D -- yes --> F1["Needs review: failed"]
+    C -- no --> E{"No result, an error, or the<br/>run's spend limit reached?"}
+    E -- yes --> F1
+    E -- no --> G{"Was this the plan-first run?"}
+    G -- yes --> P["Needs review: plan ready.<br/>'Carry out this plan' lets it edit"]
+    G -- no --> OK["Needs review: finished,<br/>with its report and Changes view"]
+```
+
+After every editing run, whatever the outcome, its changes are recorded as a patch (the **Changes** view). Agents never commit: you review and commit.
 
 ## Using the board from a VS Code Claude session
 

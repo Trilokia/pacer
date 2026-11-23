@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * Project Dashboard: a local task board that can start Claude agents in your
+ * Pacer: a local task board that can start Claude agents in your
  * project folders and show their progress. No dependencies.
  *
  *   node server.js        then open http://localhost:4577
@@ -1194,9 +1194,9 @@ function sendNotes() {
   const list = notes.splice(0);
   if (!list.length) return;
   const body = list.length === 1 ? list[0] : `${list.length} updates. ${list.slice(0, 3).join(' · ')}${list.length > 3 ? ' · …' : ''}`;
-  execFile('osascript', ['-e', `display notification ${JSON.stringify(body.slice(0, 300))} with title "Project Dashboard"`], () => {});
+  execFile('osascript', ['-e', `display notification ${JSON.stringify(body.slice(0, 300))} with title "Pacer"`], () => {});
   const topic = db.settings.ntfyTopic;
-  if (topic) fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, { method: 'POST', body, headers: { Title: 'Project Dashboard' } }).catch(() => {});
+  if (topic) fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, { method: 'POST', body, headers: { Title: 'Pacer' } }).catch(() => {});
 }
 
 // ---------------------------------------------------------------- a separate copy of the project for one task
@@ -2460,7 +2460,8 @@ server.on('error', (e) => {
 
 load();
 server.listen(PORT, HOST, () => {
-  console.log(`Project Dashboard is running: http://localhost:${PORT}`);
+  console.log(`Pacer is running: http://localhost:${PORT}`);
+  if (process.platform !== 'darwin') console.log('Note: Pacer is built for macOS. Notifications, the folder picker and the Finder buttons will not work here.');
   console.log(`Data: ${DB_FILE}`);
   console.log(findClaude() ? `Agents use: ${findClaude()}` : 'Warning: the claude program was not found. Set its path in Settings.');
 });

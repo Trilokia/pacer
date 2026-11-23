@@ -1,7 +1,12 @@
 {
-  "name": "project-dashboard",
+  "name": "pacer",
   "version": "1.0.0",
-  "private": true,
-  "description": "Local task board that starts Claude agents in your project folders and shows their progress.",
-  "scripts": { "start": "node server.js" }
+  "description": "Local task board that starts Claude Code agents in your project folders, paces them against your plan limits and shows their progress.",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "os": ["darwin"],
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
 }

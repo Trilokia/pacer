@@ -1,8 +1,36 @@
-# Project Dashboard
+# Pacer
 
-A task board for all your projects that runs on this Mac. You link project folders, add tasks, and either let the dashboard start Claude agents on them or let your own Claude sessions in VS Code pick them up. Progress and final reports show up on the board.
+A task board for all your projects that runs on your Mac. You link project folders, add tasks, and either let Pacer start Claude Code agents on them or let your own Claude sessions in VS Code pick them up. It paces the agents against your Claude plan limits, so a long queue finishes whole projects instead of leaving every project half done when the limit runs out. Progress and final reports show up on the board.
 
 It needs only Node (no `npm install`). It listens on this Mac only and is not reachable from the network.
+
+![The Pacer board with a few demo projects and tasks](docs/screenshot.png)
+
+> Pacer is an independent project. It is not made by or affiliated with Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic.
+
+## Requirements
+
+- **macOS.** Notifications, the folder picker, the Finder buttons and `start.command` use macOS tools. Pacer is built and tested on macOS only.
+- **Node.js 20 or newer.** There is nothing to install with npm.
+- **Claude Code** (the `claude` command), signed in. Agents use your own Claude plan or API key, and everything they do counts against your limits. Pacer finds `claude` on your PATH, in the usual install folders, or inside the VS Code extension; if it can't, set the path in Settings.
+- **git**, for project status, the Changes view and separate copies.
+- Optional: **VS Code** with the Claude Code extension (for the "Continue in VS Code" buttons) and the GitHub **`gh`** command (for pull requests from separate copies).
+
+## Before you use "Edit files"
+
+An **Edit files** task starts an agent that changes files in your project without asking you first. It runs in Claude Code's `auto` permission mode, which blocks risky actions by itself, and Pacer stops it from committing or pushing (see [Limits that keep things safe](#limits-that-keep-things-safe)). Still:
+
+- Use it only on projects under git, so you can see and undo every change. Each task's **Changes** view shows what it did.
+- Start with **Plan only** tasks (the default) until you trust how it works.
+- Review the changes before you commit them. Agents never commit; you do.
+
+## Install
+
+```
+git clone <this repository's URL> pacer
+cd pacer
+node server.js
+```
 
 ## Start it
 
@@ -12,7 +40,7 @@ Double-click `start.command`, or run:
 node server.js
 ```
 
-Then open http://localhost:4577. Keep the Terminal window open; closing it stops the dashboard and any agents it started.
+Then open http://localhost:4577. Keep the Terminal window open; closing it stops Pacer and any agents it started.
 
 ## Light and dark
 
@@ -56,7 +84,7 @@ Each task has a setting for what an agent may do:
 
 **Mark all done.** The Needs review column has a **Mark all done** link. Press it, then press again to confirm, and every task in the column (for the project you are looking at) moves to Done. Suggestion scans stay, so you can still add their suggestions.
 
-**A task for a project that does not exist yet.** In **New task**, choose "+ New empty project…" in the Project box. Give it a name and the folder to make it in. The dashboard makes one empty folder (with a git repository, unless you untick that), links it, and adds the task to it.
+**A task for a project that does not exist yet.** In **New task**, choose "+ New empty project…" in the Project box. Give it a name and the folder to make it in. Pacer makes one empty folder (with a git repository, unless you untick that), links it, and adds the task to it.
 
 ### Several agents in one project: separate copies
 
@@ -75,13 +103,13 @@ Normally two agents never edit the same project at once; the second waits. Tick 
 
 ### Notifications
 
-The dashboard shows a Mac notification when a task finishes, needs your OK, or your limit runs out. Several at once are folded into one. Settings can turn this off, and can also send the same lines to your phone through ntfy.sh if you give it a topic name (that sends the task id, project name and title to that outside service).
+Pacer shows a Mac notification when a task finishes, needs your OK, or your limit runs out. Several at once are folded into one. Settings can turn this off, and can also send the same lines to your phone through ntfy.sh if you give it a topic name (that sends the task id, project name and title to that outside service).
 
 ### Working on a task yourself in VS Code
 
 A task's details have a button that moves it into the Claude panel of VS Code, for when you want to steer it by hand:
 
-- **Continue in VS Code** (a task that already has a conversation): opens the project in VS Code and that same conversation in the Claude panel, with everything said so far. The task shows **In progress** as yours, so the dashboard does not run its own agent on it at the same time. When you are done, press **Finished in VS Code**: the task goes to Needs review and its Changes section shows what changed while you worked. After that, "Send a follow-up" works again and the agent knows what you did in VS Code.
+- **Continue in VS Code** (a task that already has a conversation): opens the project in VS Code and that same conversation in the Claude panel, with everything said so far. The task shows **In progress** as yours, so Pacer does not run its own agent on it at the same time. When you are done, press **Finished in VS Code**: the task goes to Needs review and its Changes section shows what changed while you worked. After that, "Send a follow-up" works again and the agent knows what you did in VS Code.
 - **Start in VS Code** (a task that has not run yet): opens VS Code with a short message ready in the Claude box. Press Enter there. Claude reads the task from the board, takes it, and reports back when it finishes, and the conversation is linked to the task.
 
 Good to know:
@@ -133,7 +161,7 @@ A scan shows on the board as a card marked **Suggestions**. Open it to read the 
 
 | Choice | Model | Good for |
 |---|---|---|
-| Auto | picked per task | Lets the dashboard decide (see below) |
+| Auto | picked per task | Lets Pacer decide (see below) |
 | Eco | Haiku | Chores: run commands, collect information, read logs |
 | Efficient | Sonnet | Small, clearly described changes |
 | Optimized | Opus | Features across files, bugs, plans |
@@ -146,10 +174,10 @@ In **Settings** you can make Auto the model for every task set to "Default", and
 
 ### Claude conversations
 
-Claude Code saves every conversation on this Mac, per folder. The dashboard reads them (it never changes them):
+Claude Code saves every conversation on this Mac, per folder. Pacer reads them (it never changes them):
 
 - **Conversations** on a project (next to its path on the board, or in its `···` details) lists the saved conversations for that folder. Click one to read it.
-- A task's **Conversations** section shows the dashboard agent's own conversation and any you linked with **Link a conversation**.
+- A task's **Conversations** section shows the Pacer agent's own conversation and any you linked with **Link a conversation**.
 - A VS Code session that claims, notes or finishes a task through `dash.js` links its own conversation to that task automatically.
 
 Both add-task dialogs show the chosen project's recent conversations on the right, so you can see where it stands while you write. Open one to see what you last asked and how Claude ended.
@@ -168,7 +196,7 @@ The strip at the top shows today's spend and how full your Claude plan limits ar
 - **Spend limit for one agent run:** a run that reaches it stops and lands in Needs review. Each task can have its own limit.
 - **Plan-limit pause:** new agents wait when your 5-hour or weekly Claude limit is this full (90% by default), so background work does not use up what you need yourself.
 
-Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts are what the runs would cost at API prices; on a Claude subscription you are not billed them. The plan-limit numbers update each time a dashboard agent runs. While tasks are paused by a full limit, the dashboard reads the limit again every 5 minutes, so a limit that was reset early is noticed and the queue starts again. **Refresh** reads it right away: the ↻ button next to the usage strip, or the Refresh button in the Usage dialog.
+Paused tasks start again by themselves, or press **Run anyway**. Dollar amounts are what the runs would cost at API prices; on a Claude subscription you are not billed them. The plan-limit numbers update each time a Pacer agent runs. While tasks are paused by a full limit, Pacer reads the limit again every 5 minutes, so a limit that was reset early is noticed and the queue starts again. **Refresh** reads it right away: the ↻ button next to the usage strip, or the Refresh button in the Usage dialog.
 
 ### Usage mode
 
@@ -184,15 +212,15 @@ The **Usage** switch in the top bar sets how careful agents are with your Claude
 | Agents at once | 1 | 2 | the number in Settings |
 | Starting agents | by room in the limit | by room in the limit | by count |
 
-**Starting by room in the limit.** In Saver and Balanced, the dashboard estimates how much of your 5-hour limit a run will take, from your own past runs on that model, and starts a waiting task only if it fits under the plan-limit pause level next to the agents already running. So small tasks can run side by side, while a big Fable task may have to wait for the one before it. A waiting task says how much it needs and how much is free; **Run anyway** starts it regardless. The first agent is never held this way. The estimates and what they are based on are shown under "What one agent run usually takes" in the Usage dialog. They are rough: your own Claude sessions use the same limit.
+**Starting by room in the limit.** In Saver and Balanced, Pacer estimates how much of your 5-hour limit a run will take, from your own past runs on that model, and starts a waiting task only if it fits under the plan-limit pause level next to the agents already running. So small tasks can run side by side, while a big Fable task may have to wait for the one before it. A waiting task says how much it needs and how much is free; **Run anyway** starts it regardless. The first agent is never held this way. The estimates and what they are based on are shown under "What one agent run usually takes" in the Usage dialog. They are rough: your own Claude sessions use the same limit.
 
-**Saver by itself.** When your 5-hour limit is 70% full, the dashboard acts as Saver whatever mode you picked, and the usage strip shows "Saver until reset". Your own mode comes back when the limit resets. Change the level, or empty the box to switch this off, under Budgets in the Usage dialog.
+**Saver by itself.** When your 5-hour limit is 70% full, Pacer acts as Saver whatever mode you picked, and the usage strip shows "Saver until reset". Your own mode comes back when the limit resets. Change the level, or empty the box to switch this off, under Budgets in the Usage dialog.
 
 **Agents at once.** Saver runs one agent at a time and Balanced two, never more than the number in Settings. **Run anyway** on a waiting task starts it regardless. **Run all anyway** at the top of the To do column does this for every waiting task shown (the chosen project or tag, or all); it shows when two or more are waiting, and asks once before it starts them, because many agents at once can use up your limit in minutes.
 
 **Plan first.** In Saver, a task that Auto sizes as Max only plans on its first run. Read the plan, then press **Carry out this plan** to let the agent edit files.
 
-**Cut off by a limit.** In every mode, an agent that your 5-hour or weekly limit cuts off goes back in the queue and continues the same conversation by itself once the limit resets (also after a restart of the dashboard). If it is cut off more than three times in a row it stops and waits for you. **Cancel** on such a task keeps what it did so far.
+**Cut off by a limit.** In every mode, an agent that your 5-hour or weekly limit cuts off goes back in the queue and continues the same conversation by itself once the limit resets (also after a restart of Pacer). If it is cut off more than three times in a row it stops and waits for you. **Cancel** on such a task keeps what it did so far.
 
 ### One project after another, and Plan a run
 
@@ -210,7 +238,7 @@ To go back to the old order (priority and time only, projects mixed), choose "Mi
 
 ### Limits that keep things safe
 
-- At most 2 agents run at once by default. You choose the number in Settings or in the "several tasks" dialog, up to one per project (16 at most). The dashboard tells you what this Mac's memory can comfortably take, but the choice is yours. Extra tasks wait in the queue.
+- At most 2 agents run at once by default. You choose the number in Settings or in the "several tasks" dialog, up to one per project (16 at most). Pacer tells you what this Mac's memory can comfortably take, but the choice is yours. Extra tasks wait in the queue.
 - Two agents never edit the same project at the same time.
 - Agents cannot commit or push. A check runs before each of their shell commands (`guard/pre-tool.js`), and git itself refuses through hooks in `guard/githooks/` that apply only to agent runs. Your own git commands are not affected.
 - Editing agents run in Claude Code's `auto` permission mode, which blocks risky actions on its own.
@@ -230,7 +258,22 @@ node /path/to/pacer/dash.js fail T12 "…"  # could not finish
 node /path/to/pacer/dash.js add "Title" -d "details" --mode plan|edit
 ```
 
-In a session you can simply say "pick up T12 from the dashboard".
+In a session you can simply say "pick up T12 from Pacer".
+
+## Known limits
+
+- Built and tested on macOS only.
+- Pacer reads some parts of Claude Code's output that are not a documented interface: the plan-limit readings, the model names (haiku, sonnet, opus, fable) and the VS Code extension's link format. A Claude Code update can break the usage features or the VS Code buttons until Pacer is updated.
+- Usage estimates are rough and cover the 5-hour limit only, not the weekly one.
+- Less tested so far: the **Browse…** folder picker, the last step of the VS Code buttons (the Claude panel showing the conversation), and pull requests from separate copies against a real GitHub repository.
+
+## Tests
+
+```
+npm test
+```
+
+This starts Pacer on a spare port with a throwaway data folder and checks that it serves the page, refuses requests from other websites, and stores projects and tasks. It never starts a real agent.
 
 ## Files
 
@@ -240,8 +283,13 @@ In a session you can simply say "pick up T12 from the dashboard".
 | `public/` | The page you see in the browser |
 | `dash.js` | Command-line helper for Claude sessions |
 | `guard/` | The no-commit checks used during agent runs |
+| `test/` | Tests (`npm test`) |
 | `data/db.json` | Your projects and tasks (created on first start) |
 | `data/runs/` | The raw output of every agent run, one file per task |
 | `data/changes/` | The recorded changes of each task, as patch files |
 
 Settings you can pass when starting: `DASH_PORT` (default 4577) and `DASH_DATA` (default `./data`).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

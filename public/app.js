@@ -392,7 +392,7 @@ function render() {
   $('#stats').textContent = S.projects.length
     ? [plural(S.projects.length, 'project'), `${runningN} in progress`, `${reviewN} to review`].join(' · ')
     : 'No projects linked yet';
-  document.title = reviewN ? `(${reviewN}) Project Dashboard` : 'Project Dashboard';
+  document.title = reviewN ? `(${reviewN}) Pacer` : 'Pacer';
 
   const banner = $('#banner');
   if (!S.meta.claude) {

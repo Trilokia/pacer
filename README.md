@@ -14,12 +14,17 @@ node server.js
 
 Then open http://localhost:4577. Keep the Terminal window open; closing it stops the dashboard and any agents it started.
 
+## Light and dark
+
+The moon / sun button in the top bar switches between the light and the dark theme. The page follows this Mac's setting until you choose; Settings has "Same as this Mac" to go back to that.
+
 ## Projects
 
 - **Link project** remembers a folder. Nothing is copied, moved or changed.
 - **Find projects inside it** lists the folders inside a parent folder so you can link many at once.
 - Each project shows its kind, git branch, number of uncommitted files and last commit. **Refresh** re-reads these.
 - The `···` button on a project opens its details: rename, change the folder, set a status, deadline and notes, open it in Finder or VS Code, or unlink it.
+- **Tags** group similar projects, for example by framework ("Android", "Node") or by kind of work ("Client work"). Type them in a project's details, with commas between them; the chips under the box add a tag another project already has, or the project's kind, with one click. The tags then show as chips above the project list. Click one to see only those projects and their tasks; click it again to see everything. A project can have up to 8 tags.
 - **Sort** above the list picks the order:
 
 | Sort | Order |
@@ -48,6 +53,29 @@ Each task has a setting for what an agent may do:
 - **Send a follow-up** to the same agent. It remembers what it did.
 - **Carry out this plan**, which turns a plan-only task into an editing run.
 - Continue the agent yourself in a terminal with the `claude --resume …` line shown at the bottom of the task.
+
+**Mark all done.** The Needs review column has a **Mark all done** link. Press it, then press again to confirm, and every task in the column (for the project you are looking at) moves to Done. Suggestion scans stay, so you can still add their suggestions.
+
+**A task for a project that does not exist yet.** In **New task**, choose "+ New empty project…" in the Project box. Give it a name and the folder to make it in. The dashboard makes one empty folder (with a git repository, unless you untick that), links it, and adds the task to it.
+
+### Several agents in one project: separate copies
+
+Normally two agents never edit the same project at once; the second waits. Tick **Work in a separate copy** on an "Edit files" task (in New task, in the task's details, or for all lines in Several tasks) and that task gets its own copy of the project on its own branch, so several can edit one project together.
+
+- The copy is a git worktree in a hidden `.dashboard-copies` folder next to the project. It starts from the project's last commit, so uncommitted work in the project is not in it. The project needs at least one commit.
+- `local.properties`, `.env` and `.env.local` are copied in, but only when git ignores them, so they can never end up in a commit.
+- When the task is finished you choose: **Apply to project** puts the changes into the project folder, uncommitted, like a normal task. **Open pull request** asks for a title and description, then commits the changes under your name, pushes the branch and opens the pull request with `gh`. Nothing is merged. **Remove the copy** throws it away.
+- If two copies changed the same lines, the second "Apply" is refused: use a pull request for that one.
+- Marking the task done removes its copy once the changes are applied or in a pull request.
+
+### Order and repeats
+
+- **Run after** (in a task's details) makes a task wait until another one has finished. In Several tasks, "In each project, run them one after another" sets this for the whole list.
+- **Repeat** runs a task again every day or every week after it last finished. A suggestions scan simply looks again; any other task gets a fresh copy of itself.
+
+### Notifications
+
+The dashboard shows a Mac notification when a task finishes, needs your OK, or your limit runs out. Several at once are folded into one. Settings can turn this off, and can also send the same lines to your phone through ntfy.sh if you give it a topic name (that sends the task id, project name and title to that outside service).
 
 ### Working on a task yourself in VS Code
 
@@ -96,6 +124,8 @@ A link like `http://localhost:4577/#T12` opens that task.
 If the project sits in a folder with a shared `CLAUDE.md` (for example several apps in one parent folder), the `plans/` and `docs/` folders next to it are read too.
 
 Each project comes back with a short summary and a list of suggestions, marked "Left in your notes" or "AI idea". Tick the ones you want, switch any of them between Plan only and Edit files, and press **Add to board** or **Add and run agents**. Each new task gets the model level the scan judged it needs.
+
+Only the projects ticked in the list show their suggestions, so tick one project to see just that one. Each project's result folds open and shut by clicking its name; it starts open while it has suggestions you haven't added yet. Suggestions already on the board are folded away under "N already added".
 
 A scan shows on the board as a card marked **Suggestions**. Open it to read the result again, send a follow-up ("look closer at the tests"), or **Look again**. Mark it done when you have taken what you want. Tasks already on the board are not suggested again.
 
@@ -151,13 +181,32 @@ The **Usage** switch in the top bar sets how careful agents are with your Claude
 | Thinking effort | lower on Haiku and Sonnet | normal | normal |
 | Spend limit for one run | $3 unless you set one | only if you set one | only if you set one |
 | A task Auto sizes as Max | plans first, edits after your OK | runs directly | runs directly |
+| Agents at once | 1 | 2 | the number in Settings |
 | Starting agents | by room in the limit | by room in the limit | by count |
 
-**Starting by room in the limit.** In Saver and Balanced, the dashboard estimates how much of your 5-hour limit a run will take, from your own past runs on that model, and starts a waiting task only if it fits under the plan-limit pause level next to the agents already running. So nine small tasks can run together, while big Fable tasks go a few at a time. A waiting task says how much it needs and how much is free; **Run anyway** starts it regardless. The first agent is never held this way. The estimates and what they are based on are shown under "What one agent run usually takes" in the Usage dialog. They are rough: your own Claude sessions use the same limit.
+**Starting by room in the limit.** In Saver and Balanced, the dashboard estimates how much of your 5-hour limit a run will take, from your own past runs on that model, and starts a waiting task only if it fits under the plan-limit pause level next to the agents already running. So small tasks can run side by side, while a big Fable task may have to wait for the one before it. A waiting task says how much it needs and how much is free; **Run anyway** starts it regardless. The first agent is never held this way. The estimates and what they are based on are shown under "What one agent run usually takes" in the Usage dialog. They are rough: your own Claude sessions use the same limit.
+
+**Saver by itself.** When your 5-hour limit is 70% full, the dashboard acts as Saver whatever mode you picked, and the usage strip shows "Saver until reset". Your own mode comes back when the limit resets. Change the level, or empty the box to switch this off, under Budgets in the Usage dialog.
+
+**Agents at once.** Saver runs one agent at a time and Balanced two, never more than the number in Settings. **Run anyway** on a waiting task starts it regardless. **Run all anyway** at the top of the To do column does this for every waiting task shown (the chosen project or tag, or all); it shows when two or more are waiting, and asks once before it starts them, because many agents at once can use up your limit in minutes.
 
 **Plan first.** In Saver, a task that Auto sizes as Max only plans on its first run. Read the plan, then press **Carry out this plan** to let the agent edit files.
 
 **Cut off by a limit.** In every mode, an agent that your 5-hour or weekly limit cuts off goes back in the queue and continues the same conversation by itself once the limit resets (also after a restart of the dashboard). If it is cut off more than three times in a row it stops and waits for you. **Cancel** on such a task keeps what it did so far.
+
+### One project after another, and Plan a run
+
+Waiting tasks start **one project after another**: agents finish all waiting tasks of one project before they begin the next. So when your limit runs out, some projects are finished and the others are untouched, not every project half done.
+
+- The order: a project agents are already working on, then the order you chose in Plan a run, then the project that needs the least of your limit (that way the most projects get finished). Inside a project, tasks go by priority and time as before.
+- With two or more agents at once, a second project starts next to the first only when both fit in what is free of your 5-hour limit. If they do not fit, its tasks say which project is finished first. **Run anyway** starts one regardless.
+- A task that waits for you (for example its "Run after" task needs your OK) does not hold other projects back.
+
+**Plan a run** (top bar) shows, for every project with open tasks, about how much of your 5-hour limit they will take, the usage in dollars and the agent time, next to how much of the limit is free now. Tick projects to see the total and which ones still fit; **Pick the most that fit** ticks as many whole projects as fit, smallest first. The arrows change the order. **Run … in this order** queues every To do task of the ticked projects.
+
+The numbers are rough: they come from your own past runs on each model, they count the 5-hour limit only, and your own Claude sessions use the same limit. A project that does not fit still starts when its turn comes; its tasks wait for the reset when the limit is full and then continue by themselves.
+
+To go back to the old order (priority and time only, projects mixed), choose "Mixed" under "How waiting tasks start" in Plan a run.
 
 ### Limits that keep things safe
 

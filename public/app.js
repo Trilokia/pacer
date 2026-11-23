@@ -152,14 +152,38 @@ function md(source) {
   return root;
 }
 
+// ---------------------------------------------------------------- theme
+
+// The page follows this Mac's light or dark setting until you choose one.
+const ICON_SUN = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="3.6"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg>';
+const ICON_MOON = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M16.5 12.2A7 7 0 0 1 7.8 3.5a7 7 0 1 0 8.7 8.7z"/></svg>';
+const themeChoice = () => { try { return localStorage.getItem('dash.theme') || ''; } catch { return ''; } };
+const themeNow = () => document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+function setTheme(choice) {
+  if (choice === 'light' || choice === 'dark') document.documentElement.dataset.theme = choice;
+  else delete document.documentElement.dataset.theme;
+  try { if (choice) localStorage.setItem('dash.theme', choice); else localStorage.removeItem('dash.theme'); } catch { /* private window */ }
+  paintTheme();
+}
+function paintTheme() {
+  const b = $('#btn-theme');
+  const dark = themeNow() === 'dark';
+  b.innerHTML = dark ? ICON_SUN : ICON_MOON; // fixed markup, nothing from outside
+  b.title = dark ? 'Switch to the light theme' : 'Switch to the dark theme';
+  b.setAttribute('aria-label', b.title);
+}
+
 // ---------------------------------------------------------------- state
 
-let S = { settings: {}, projects: [], tasks: [], meta: {}, usage: null };
+let S = { settings: {}, projects: [], tasks: [], meta: {}, usage: null, forecast: null };
 const ui = {
   filter: localStorage.getItem('dash.filter') || 'all',
+  tag: localStorage.getItem('dash.tag') || '', // show only projects with this tag ('' = all)
   open: null,       // id of the task shown in the drawer
   task: null,       // full task (with activity log) for the drawer
   allDone: false,
+  armDone: 0,       // until when "Mark all done" waits for its second click
+  armRun: 0,        // the same for "Run all anyway"
   loaded: false,
   sel: new Map(),   // "T12/r1s3" -> { on, mode }: suggestions you ticked, and the mode chosen for each
   onState: null,    // lets an open dialog follow live updates
@@ -170,21 +194,27 @@ const TIERS = [['eco', 'Eco', 'haiku'], ['efficient', 'Efficient', 'sonnet'], ['
 const MODEL_NAME = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus', fable: 'Fable' };
 // False while the page is newer than the running server (it was updated but
 // not restarted yet): the new features stay hidden until the restart.
-const PAGE_VERSION = 5;
+const PAGE_VERSION = 10;
 const serverHas = (n) => (S.meta.version || 1) >= n;
 const v2 = () => serverHas(2);
 
 // How careful agents are with your Claude limit.
 const USAGE_MODES = [
-  ['saver', 'Saver', 'Uses the least: Auto picks the model for every task set to Default, nothing runs above Optimized (Opus), small models think less, a run stops at its spend limit, and the biggest tasks plan first and edit only after your OK.'],
-  ['balanced', 'Balanced', 'Auto picks the model for every task set to Default. Nothing else is held back.'],
-  ['full', 'Full power', 'Tasks set to Default use Claude Code\'s own model, and agents start by count alone.'],
+  ['saver', 'Saver', 'Uses the least: one agent at a time, Auto picks the model for every task set to Default, nothing runs above Optimized (Opus), small models think less, a run stops at its spend limit, and the biggest tasks plan first and edit only after your OK.'],
+  ['balanced', 'Balanced', 'Two agents at a time, and Auto picks the model for every task set to Default. Nothing else is held back.'],
+  ['full', 'Full power', 'Tasks set to Default use Claude Code\'s own model, and as many agents run at once as Settings allows.'],
 ];
-const usageMode = () => (serverHas(5) && S.settings.usageMode) || 'full';
+// The mode you picked, and the mode in force: the dashboard acts as Saver
+// while your 5-hour limit is nearly full, whatever you picked.
+const chosenMode = () => (serverHas(5) && S.settings.usageMode) || 'full';
+const steppedDown = () => Boolean(serverHas(8) && S.usage && S.usage.stepped);
+const usageMode = () => (steppedDown() ? 'saver' : chosenMode());
+const steppedNote = () => `Acting as Saver for now: your 5-hour limit is ${S.usage.autoSaver}% full or more. Your own mode comes back by itself when the limit resets.`;
 // What "Default" means for a task right now.
 const defaultModel = () => S.settings.defaultModel || (usageMode() === 'full' ? '' : 'auto');
 // A waiting task that "Run anyway" can push through.
-const canForce = (t) => /^(Paused|Waiting for room|Waiting for your Claude)/.test(t.waitReason || '');
+const canForce = (t) => /^(Paused|Waiting for room|Waiting for your Claude|Waiting for T\d|Waiting: T\d)/.test(t.waitReason || '');
+const REPEATS = [['', 'Never'], ['daily', 'Every day'], ['weekly', 'Every week']];
 const plansFirst = (t) => t.phase === 'plan';
 
 function modelLabel(v) {
@@ -216,6 +246,7 @@ async function refresh(fresh) {
   S = await api('GET', `/api/state${fresh ? '?fresh=1' : ''}`, null, { quiet: ui.loaded });
   ui.loaded = true;
   if (ui.filter !== 'all' && !S.projects.some((p) => p.id === ui.filter)) setFilter('all', true);
+  if (ui.tag && !S.projects.some((p) => hasTag(p, ui.tag))) setTag('', true);
   render();
   if (ui.open) loadOpen();
 }
@@ -231,6 +262,31 @@ function setFilter(id, silent) {
   ui.filter = id;
   ui.allDone = false;
   localStorage.setItem('dash.filter', id);
+  if (!silent) render();
+}
+
+// ---------------------------------------------------------------- project tags
+
+// Tags group similar projects ("Android", "Client work"). Picking one in the
+// side list shows only those projects and their tasks.
+const tagsOf = (p) => (p && p.tags) || [];
+const hasTag = (p, tag) => tagsOf(p).some((x) => x.toLowerCase() === tag.toLowerCase());
+const inTag = (p) => !ui.tag || hasTag(p, ui.tag);
+function allTags() {
+  const seen = new Map(); // lower-case tag -> [tag, number of projects]
+  for (const p of S.projects) for (const x of tagsOf(p)) {
+    const row = seen.get(x.toLowerCase()) || [x, 0];
+    row[1]++;
+    seen.set(x.toLowerCase(), row);
+  }
+  return [...seen.values()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+function setTag(tag, silent) {
+  ui.tag = tag;
+  ui.allDone = false;
+  localStorage.setItem('dash.tag', tag);
+  // A project outside the chosen tag would be open but missing from the list.
+  if (ui.filter !== 'all' && !inTag(S.projects.find((p) => p.id === ui.filter))) setFilter('all', true);
   if (!silent) render();
 }
 
@@ -353,10 +409,11 @@ function render() {
     banner.hidden = true;
   }
   $('#btn-suggest').hidden = !v2() || !S.projects.length;
+  $('#btn-plan').hidden = !serverHas(10) || !S.forecast || !S.forecast.projects.length;
   $('#usage-refresh').hidden = !serverHas(3) || !S.usage;
   const pick = $('#usage-mode');
   pick.hidden = !serverHas(5);
-  if (document.activeElement !== pick) pick.value = usageMode();
+  if (document.activeElement !== pick) pick.value = chosenMode();
 
   renderUsageStrip();
   renderProjects();
@@ -376,15 +433,23 @@ function renderUsageStrip() {
     bits.push(h('span', { class: 'u-item' }, h('span', { class: 'u-label' }, label), meter(label, st), h('strong', null, `${st.pct}%`)));
   }
   if (u.hold) bits.push(h('span', { class: 'chip high' }, 'Queue paused'));
+  else if (steppedDown()) bits.push(h('span', { class: 'chip', title: steppedNote() }, 'Saver until reset'));
   el.replaceChildren(...bits);
 }
 
 function renderProjects() {
   const nav = $('#projects');
-  const open = (p) => S.tasks.filter((t) => t.status !== 'done' && (!p || t.projectId === p.id));
+  const open = (p) => S.tasks.filter((t) => t.status !== 'done' && (p ? t.projectId === p.id : inTag(projectOf(t))));
+  const tags = allTags();
+  $('#proj-tags').hidden = !tags.length;
+  $('#proj-tags').replaceChildren(...tags.map(([tag, n]) => h('button', {
+    class: `chip tag${hasTag({ tags: [tag] }, ui.tag) ? ' on' : ''}`, 'aria-pressed': String(hasTag({ tags: [tag] }, ui.tag)),
+    title: ui.tag && hasTag({ tags: [tag] }, ui.tag) ? 'Show all projects again' : `Show only the ${plural(n, 'project')} tagged ${tag}`,
+    onclick: () => setTag(hasTag({ tags: [tag] }, ui.tag) ? '' : tag),
+  }, `${tag} ${n}`)));
   const rows = [
     h('button', { class: `proj${ui.filter === 'all' ? ' on' : ''}`, onclick: () => setFilter('all') },
-      h('span', { class: 'proj-name' }, 'All projects'),
+      h('span', { class: 'proj-name' }, ui.tag ? `All tagged ${ui.tag}` : 'All projects'),
       h('span', { class: 'proj-right' }, h('span', { class: 'count' }, open().length))),
   ];
   const mode = projSort();
@@ -399,6 +464,7 @@ function renderProjects() {
   if ($('#proj-sort').value !== mode) $('#proj-sort').value = mode;
   $('#proj-tip').hidden = mode !== 'custom';
   for (const p of sorted) {
+    if (!inTag(p)) continue;
     const mine = open(p);
     const busy = mine.some((t) => t.status === 'running');
     const info = p.info || {};
@@ -464,7 +530,8 @@ function renderProjects() {
       busy && h('span', { class: 'dot', title: 'Work in progress' }),
       h('span', { class: 'count' }, mine.length),
       h('button', { class: 'more', title: 'Project details', 'aria-label': `Details for ${p.name}`, onclick: (e) => { e.stopPropagation(); projectDialog(p.id); } }, '···')),
-    h('span', { class: 'proj-sub' }, sub.flatMap((x, i) => (i ? [' · ', x] : [x])))));
+    h('span', { class: 'proj-sub' }, sub.flatMap((x, i) => (i ? [' · ', x] : [x]))),
+    tagsOf(p).length ? h('span', { class: 'proj-tags' }, tagsOf(p).map((x) => h('span', { class: 'chip' }, x))) : null));
   }
   rows.push(h('button', { class: 'btn small add', onclick: () => linkDialog() }, '+ Link project'));
   nav.replaceChildren(...rows);
@@ -487,7 +554,7 @@ const SORT = {
 function renderBoard() {
   const board = $('#board');
   const project = S.projects.find((p) => p.id === ui.filter);
-  $('#board-title').textContent = project ? project.name : 'All projects';
+  $('#board-title').textContent = project ? project.name : ui.tag ? `Projects tagged ${ui.tag}` : 'All projects';
   const sub = $('#board-sub');
   sub.replaceChildren();
   if (project) {
@@ -507,7 +574,7 @@ function renderBoard() {
     return;
   }
 
-  const tasks = S.tasks.filter((t) => ui.filter === 'all' || t.projectId === ui.filter);
+  const tasks = S.tasks.filter((t) => (ui.filter === 'all' ? inTag(projectOf(t)) : t.projectId === ui.filter));
   board.replaceChildren(...COLS.map((col) => {
     let list = tasks.filter(col.match).sort(SORT[col.key]);
     const total = list.length;
@@ -516,12 +583,69 @@ function renderBoard() {
       list = list.slice(0, 15);
       more = h('button', { class: 'link', onclick: () => { ui.allDone = true; renderBoard(); } }, `Show all ${total}`);
     }
-    return h('section', { class: 'col' },
-      h('div', { class: 'col-head' }, h('h3', null, col.title), h('span', { class: 'count' }, total)),
+    return h('section', { class: `col col-${col.key}` },
+      h('div', { class: 'col-head' }, h('h3', null, col.title), h('span', { class: 'count' }, total),
+        col.key === 'review' && markAllDone(list),
+        col.key === 'todo' && runAllAnyway(list)),
       h('div', { class: 'col-body' },
         list.length ? list.map(card) : h('div', { class: 'empty' }, col.empty),
         more));
   }));
+}
+
+// "Mark all done" for the Needs review column. Suggestion scans are left
+// alone, so their suggestions stay available. It asks once before it acts.
+function markAllDone(list) {
+  const ids = list.filter((t) => t.kind !== 'scan').map((t) => t.id);
+  if (!serverHas(6) || !ids.length) return null;
+  const armed = ui.armDone > Date.now();
+  return h('button', {
+    class: `link col-action${armed ? ' armed' : ''}`,
+    title: 'Moves every task in this column to Done. Suggestion scans stay here.',
+    onclick: async () => {
+      if (!armed) {
+        ui.armDone = Date.now() + 5000;
+        renderBoard();
+        setTimeout(() => { if (ui.armDone && ui.armDone <= Date.now()) { ui.armDone = 0; renderBoard(); } }, 5100);
+        return;
+      }
+      ui.armDone = 0;
+      try {
+        const r = await api('POST', '/api/tasks/mark-done', { ids });
+        toast(`Marked ${plural(r.done, 'task')} done.`);
+      } catch { /* the error is already shown */ }
+      refresh().catch(() => {});
+    },
+  }, armed ? `Mark ${ids.length} done?` : 'Mark all done');
+}
+
+// "Run all anyway" for the To do column: starts every waiting task that
+// "Run anyway" could push through, in the tasks shown now (the chosen project
+// or tag). Many agents at once can use up your Claude limit fast, so it asks
+// once before it acts.
+function runAllAnyway(list) {
+  const ids = list.filter(canForce).map((t) => t.id);
+  if (ids.length < 2) return null;
+  const armed = ui.armRun > Date.now();
+  return h('button', {
+    class: `link col-action${armed ? ' armed' : ''}`,
+    title: 'Starts every waiting task now, without waiting for room, the limit, the agents-at-once cap or the task before it.',
+    onclick: async () => {
+      if (!armed) {
+        ui.armRun = Date.now() + 5000;
+        renderBoard();
+        setTimeout(() => { if (ui.armRun && ui.armRun <= Date.now()) { ui.armRun = 0; renderBoard(); } }, 5100);
+        return;
+      }
+      ui.armRun = 0;
+      let n = 0;
+      for (const id of ids) {
+        try { await api('POST', `/api/tasks/${id}/run`, { force: true }, { quiet: true }); n++; } catch { /* finished or stopped meanwhile */ }
+      }
+      toast(`Started ${plural(n, 'task')} anyway.`);
+      refresh().catch(() => {});
+    },
+  }, armed ? `Run ${ids.length} now?` : 'Run all anyway');
 }
 
 function whoText(t) {
@@ -694,7 +818,7 @@ function renderDrawer() {
 
   const scan = t.kind === 'scan';
   const usesAuto = (t.model || defaultModel()) === 'auto';
-  part('#d-fields', [t.title, t.description, t.projectId, t.mode, t.model, t.priority, t.budget, S.settings.taskBudget, defaultModel(), usageMode(), S.meta.version, t.auto && t.auto.at, t.phase, t.status, lock, S.projects.map((p) => p.id + p.name).join()].join('\u0001'), () =>
+  part('#d-fields', [t.title, t.description, t.projectId, t.mode, t.model, t.priority, t.budget, S.settings.taskBudget, defaultModel(), usageMode(), S.meta.version, t.auto && t.auto.at, t.phase, t.status, t.after, t.repeat, t.copy, JSON.stringify(t.work || 0), S.tasks.length, lock, S.projects.map((p) => p.id + p.name).join()].join('\u0001'), () =>
     h('div', { class: 'stack' },
       h('input', { type: 'text', class: 'd-title', value: t.title, 'aria-label': 'Title', onchange: (e) => patchTask(id, { title: e.target.value }) }),
       scan
@@ -705,7 +829,21 @@ function renderDrawer() {
         !scan && field('Agent may', select(MODES, t.mode, (v) => patchTask(id, { mode: v }), lock)),
         field('Model', select(modelOptions(), t.model, (v) => patchTask(id, { model: v }), lock)),
         field('Priority', select(PRIORITIES, t.priority, (v) => patchTask(id, { priority: v }))),
-        field('Spend limit for one run ($)', budgetInput(t.budget, (v) => patchTask(id, { budget: v }), lock))),
+        field('Spend limit for one run ($)', budgetInput(t.budget, (v) => patchTask(id, { budget: v }), lock)),
+        serverHas(7) && !scan && field('Run after', select(
+          [['', 'Nothing: run when started'], ...S.tasks.filter((x) => x.id !== id && !x.kind && (x.status !== 'done' || x.id === t.after)).map((x) => [x.id, `${x.id} · ${x.title.slice(0, 40)}`])],
+          t.after || '', (v) => patchTask(id, { after: v }))),
+        serverHas(7) && field('Repeat', select(REPEATS, t.repeat || '', (v) => patchTask(id, { repeat: v })))),
+      serverHas(7) && !scan && t.mode === 'edit' && h('label', { class: 'cp-link' },
+        h('input', { type: 'checkbox', checked: Boolean(t.copy), disabled: lock || Boolean(t.work), onchange: (e) => patchTask(id, { copy: e.target.checked }) }),
+        'Work in a separate copy of the project, so other agents can edit it at the same time'),
+      t.work && h('p', { class: 'hint' }, [
+        `Separate copy on branch ${t.work.branch}.`,
+        t.work.pr ? `Pull request: ${t.work.pr}.` : null,
+        t.work.applied ? 'Its changes were applied to the project folder.' : null,
+        !t.work.pr && !t.work.applied && t.status === 'review' ? 'The changes are only in the copy until you apply them or open a pull request.' : null,
+      ].filter(Boolean).join(' ')),
+      t.repeat && h('p', { class: 'hint' }, scan ? 'Repeats: it looks again by itself after that time.' : 'Repeats: after that time a fresh copy of this task is added and started.'),
       scan && h('p', { class: 'hint' }, `${projectOf(t) ? projectOf(t).name : 'Project'}: Claude looks at ${t.scan && t.scan.code ? (t.scan.notes ? 'the notes, the plans and the code' : 'the code') : 'the notes and plan files'} and changes nothing.`),
       usesAuto && h('p', { class: 'hint' }, t.auto
         ? `Auto picked ${modelLabel(t.auto.model)}: ${t.auto.why}.`
@@ -716,7 +854,7 @@ function renderDrawer() {
 
   // A task with a saved conversation can be continued in VS Code; one without can be started there.
   const hasConvo = (t.conversationInfo || []).some((c) => !c.missing);
-  part('#d-actions', [t.status, t.outcome, t.mode, t.phase, Boolean(t.sessionId), isAgent(t), canForce(t), hasConvo, Boolean(t.ide), S.meta.version].join('|'), () => {
+  part('#d-actions', [t.status, t.outcome, t.mode, t.phase, Boolean(t.sessionId), isAgent(t), canForce(t), hasConvo, Boolean(t.ide), S.meta.version, JSON.stringify(t.work || 0)].join('|'), () => {
     const b = [];
     const btn = (label, fn, cls = '') => h('button', { class: `btn ${cls}`, onclick: fn }, label);
     const vscode = (label) => {
@@ -742,6 +880,22 @@ function renderDrawer() {
       b.push(btn('Mark done', () => patchTask(id, { status: 'done' }), planned && plansFirst(t) ? '' : 'primary'));
       if (planned) {
         b.push(btn('Carry out this plan', () => runTask(id, { mode: 'edit', message: 'I have read your plan. Go ahead and carry it out now. You may edit files. Do not commit.' }), plansFirst(t) ? 'primary' : ''));
+      }
+      if (t.work) {
+        const copyDo = async (what, body, el) => {
+          if (document.activeElement) document.activeElement.blur();
+          el.disabled = true;
+          try { await api('POST', `/api/tasks/${id}/copy`, { do: what, ...body }); } catch { /* the error is already shown */ }
+          el.disabled = false;
+          refreshSoon();
+        };
+        if (!t.work.applied) { const el = btn('Apply to project', () => copyDo('apply', {}, el)); el.title = 'Puts the changes into the project folder, uncommitted, like a normal task.'; b.push(el); }
+        if (!t.work.pr) b.push(btn('Open pull request', () => pullRequestDialog(t)));
+        const rm = btn('Remove the copy', () => {
+          if (rm.dataset.armed || t.work.applied || t.work.pr) return copyDo('remove', {}, rm);
+          rm.dataset.armed = '1'; rm.textContent = 'Throw its changes away?';
+        }, 'ghost');
+        b.push(rm);
       }
       b.push(vscode(), btn(scan ? 'Look again' : 'Run again from scratch', () => runTask(id)), btn('Back to To do', () => patchTask(id, { status: 'todo' })));
     } else {
@@ -869,29 +1023,42 @@ const addedAs = (s) => (s.taskId && S.tasks.some((x) => x.id === s.taskId) ? s.t
 const openSuggestions = (t) => (t.suggestions || []).filter((s) => !addedAs(s));
 const tickedIn = (t) => openSuggestions(t).filter((s) => (ui.sel.get(selKey(t, s)) || {}).on);
 
+// Which folds in the suggestion lists are open, so a redraw keeps them as you left them.
+const sugOpen = new Map();
+
 // The suggestions of one scan, each with a tick box and its own Plan / Edit switch.
+// The ones already on the board are folded away under "N already added".
 function suggestionRows(t, onchange) {
-  return h('ul', { class: 'found sug-list' }, t.suggestions.map((s) => {
-    const key = selKey(t, s);
-    const st = ui.sel.get(key) || { on: false, mode: s.mode };
-    const taskId = addedAs(s);
-    const set = (patch) => { Object.assign(st, patch); ui.sel.set(key, st); onchange(); };
-    const modeBtn = h('button', { class: 'chip mode', title: 'What the agent may do for this task. Click to switch.', onclick: () => { set({ mode: st.mode === 'edit' ? 'plan' : 'edit' }); paint(); } });
-    const paint = () => { modeBtn.className = `chip mode ${st.mode}`; modeBtn.textContent = st.mode === 'edit' ? 'Edit files' : 'Plan only'; };
-    paint();
-    return h('li', { class: `sug${taskId ? ' is-added' : ''}` },
-      h('div', { class: 'sug-top' },
-        h('label', { class: 'sug-pick' },
-          taskId ? h('span', { class: 'sug-tick' }, '✓') : h('input', { type: 'checkbox', checked: st.on, onchange: (e) => set({ on: e.target.checked }) }),
-          h('span', { class: 'sug-title' }, s.title)),
-        s.priority === 'high' && h('span', { class: 'chip high' }, 'High'),
-        h('span', { class: 'chip' }, s.source === 'notes' ? 'Left in your notes' : 'AI idea'),
-        taskId
-          ? h('button', { class: 'link', onclick: () => { if ($('#dlg').open) closeDialog(); openTask(taskId); } }, `Added as ${taskId}`)
-          : modeBtn),
-      h('p', { class: 'sug-details' }, s.details),
-      h('p', { class: 'hint' }, [s.from && `From: ${s.from}`, `Model: ${modelLabel(cappedTier(s.size)[2])}`, s.priority === 'low' && 'Low priority'].filter(Boolean).join(' · ')));
-  }));
+  const fresh = t.suggestions.filter((s) => !addedAs(s));
+  const added = t.suggestions.filter((s) => addedAs(s));
+  const addedKey = `added:${t.id}`;
+  return h('div', { class: 'sug-rows' },
+    fresh.length ? h('ul', { class: 'found sug-list' }, fresh.map((s) => suggestionRow(t, s, onchange))) : h('p', { class: 'hint' }, 'Every suggestion here is already on the board.'),
+    added.length && h('details', { class: 'sug-added', open: sugOpen.get(addedKey), ontoggle: (e) => sugOpen.set(addedKey, e.target.open) },
+      h('summary', null, `${plural(added.length, 'suggestion')} already added`),
+      h('ul', { class: 'found sug-list' }, added.map((s) => suggestionRow(t, s, onchange)))));
+}
+
+function suggestionRow(t, s, onchange) {
+  const key = selKey(t, s);
+  const st = ui.sel.get(key) || { on: false, mode: s.mode };
+  const taskId = addedAs(s);
+  const set = (patch) => { Object.assign(st, patch); ui.sel.set(key, st); onchange(); };
+  const modeBtn = h('button', { class: 'chip mode', title: 'What the agent may do for this task. Click to switch.', onclick: () => { set({ mode: st.mode === 'edit' ? 'plan' : 'edit' }); paint(); } });
+  const paint = () => { modeBtn.className = `chip mode ${st.mode}`; modeBtn.textContent = st.mode === 'edit' ? 'Edit files' : 'Plan only'; };
+  paint();
+  return h('li', { class: `sug${taskId ? ' is-added' : ''}` },
+    h('div', { class: 'sug-top' },
+      h('label', { class: 'sug-pick' },
+        taskId ? h('span', { class: 'sug-tick' }, '✓') : h('input', { type: 'checkbox', checked: st.on, onchange: (e) => set({ on: e.target.checked }) }),
+        h('span', { class: 'sug-title' }, s.title)),
+      s.priority === 'high' && h('span', { class: 'chip high' }, 'High'),
+      h('span', { class: 'chip' }, s.source === 'notes' ? 'Left in your notes' : 'AI idea'),
+      taskId
+        ? h('button', { class: 'link', onclick: () => { if ($('#dlg').open) closeDialog(); openTask(taskId); } }, `Added as ${taskId}`)
+        : modeBtn),
+    h('p', { class: 'sug-details' }, s.details),
+    h('p', { class: 'hint' }, [s.from && `From: ${s.from}`, `Model: ${modelLabel(cappedTier(s.size)[2])}`, s.priority === 'low' && 'Low priority'].filter(Boolean).join(' · ')));
 }
 
 // "Add to board" and "Add and run" for the ticked suggestions of some scans.
@@ -930,16 +1097,17 @@ function suggestDialog() {
   const projects = sortedProjects();
   // A project keeps one open scan; a scan you marked done no longer shows here.
   const scanOf = (pid) => S.tasks.filter((t) => t.kind === 'scan' && t.projectId === pid && t.status !== 'done').sort((a, b) => b.createdAt - a.createdAt)[0];
-  const scans = () => projects.map((p) => scanOf(p.id)).filter(Boolean);
   const busy = (t) => Boolean(t) && (t.status === 'running' || t.status === 'queued');
   const chosen = new Set(projects.some((p) => p.id === ui.filter) ? [ui.filter] : []);
+  // Only the ticked projects show their suggestions, and only those can be added.
+  const scans = () => projects.filter((p) => chosen.has(p.id)).map((p) => scanOf(p.id)).filter(Boolean);
 
   const look = select([['notes', 'Notes and plan files (quick)'], ['both', 'Notes, plans and the code (thorough)'], ['code', 'The code only']], 'notes', () => {});
   const model = select(modelOptions().slice(1), 'auto', () => {});
   const focus = h('input', { type: 'text', placeholder: 'Optional, for example: what blocks the release' });
   const goBtn = h('button', { class: 'btn primary', onclick: start });
   const results = h('div', { class: 'sug-results' });
-  const none = h('p', { class: 'hint' }, 'Nothing yet. Tick projects above and press the button. Suggestions show up here as each project finishes.');
+  const none = h('p', { class: 'hint' });
   const btns = adoptButtons(scans);
 
   const stateOf = (p) => {
@@ -951,7 +1119,8 @@ function suggestDialog() {
     if (t.outcome === 'stopped') return ['Stopped', ''];
     const total = (t.suggestions || []).length;
     const left = openSuggestions(t).length;
-    return [`${plural(total, 'suggestion')}${total && left < total ? `, ${left} not added yet` : ''} · ${ago(t.finishedAt)}`, ''];
+    const count = total && !left ? `all ${total} added` : `${plural(total, 'suggestion')}${total && left < total ? `, ${left} not added yet` : ''}`;
+    return [`${count} · ${ago(t.finishedAt)}`, ''];
   };
   const rows = projects.map((p) => {
     const box = h('input', { type: 'checkbox', checked: chosen.has(p.id), onchange: () => { if (box.checked) chosen.add(p.id); else chosen.delete(p.id); paint(); } });
@@ -985,15 +1154,26 @@ function suggestDialog() {
     sections.clear();
     paint();
   };
+  // One project's result, folded open or shut. It starts open while it has
+  // suggestions you have not added yet, and keeps whatever you set after that.
   function section(p, t) {
     const failed = t.status === 'review' && t.outcome === 'failed';
-    return h('section', null,
-      h('div', { class: 'sug-head' },
+    const total = (t.suggestions || []).length;
+    const left = openSuggestions(t).length;
+    const count = !t.suggestions ? null
+      : !total ? 'nothing to suggest'
+      : !left ? `all ${total} added`
+      : `${left} to pick${left < total ? ` · ${total - left} added` : ''}`;
+    // Buttons sit in the fold's header; this stops their click from folding it too.
+    const act = (fn) => (e) => { e.preventDefault(); fn(); };
+    return h('details', { class: 'sug-proj', open: sugOpen.has(p.id) ? sugOpen.get(p.id) : left > 0 || failed, ontoggle: (e) => sugOpen.set(p.id, e.target.open) },
+      h('summary', { class: 'sug-head' },
         h('h4', null, p.name),
+        count && h('span', { class: `chip${left ? ' fits' : ''}` }, count),
         h('span', { class: 'hint' }, [busy(t) ? 'Looking again…' : ago(t.finishedAt), t.cost ? money(t.cost) : null].filter(Boolean).join(' · ')),
         h('span', { class: 'spacer' }),
-        openSuggestions(t).length > 1 && h('button', { class: 'link', onclick: () => tickAll([t], true) }, 'Tick all'),
-        h('button', { class: 'link', onclick: () => { closeDialog(); openTask(t.id); } }, `Open ${t.id}`)),
+        left > 1 && h('button', { class: 'link', onclick: act(() => tickAll([t], true)) }, 'Tick all'),
+        h('button', { class: 'link', onclick: act(() => { closeDialog(); openTask(t.id); }) }, `Open ${t.id}`)),
       failed && h('p', { class: 'bulk-err' }, `The last look did not finish. Open ${t.id} to see why.`),
       t.summary && h('p', { class: 'sug-summary' }, t.summary),
       t.suggestions && (t.suggestions.length ? suggestionRows(t, btns.update) : h('p', { class: 'hint' }, 'Nothing to suggest right now.')));
@@ -1010,6 +1190,7 @@ function suggestDialog() {
     goBtn.disabled = !n;
     const want = [];
     for (const p of projects) {
+      if (!chosen.has(p.id)) continue;
       const t = scanOf(p.id);
       if (!t || !(t.suggestions || (t.status === 'review' && t.outcome === 'failed'))) continue;
       const key = JSON.stringify([t.id, t.status, t.outcome, t.summary, t.cost, (t.suggestions || []).map((s) => [s.id, addedAs(s)])]);
@@ -1018,6 +1199,10 @@ function suggestDialog() {
       want.push(sec.el);
     }
     none.hidden = want.length > 0;
+    const elsewhere = projects.filter((p) => !chosen.has(p.id) && (scanOf(p.id) || {}).suggestions).length;
+    none.textContent = !n
+      ? `Tick a project above to see its suggestions here.${elsewhere ? ` ${plural(elsewhere, 'project')} already ${elsewhere === 1 ? 'has' : 'have'} some.` : ''}`
+      : 'Nothing yet for the ticked projects. Press the button above; suggestions show up here as each project finishes.';
     if (want.length !== results.children.length || want.some((el, i) => results.children[i] !== el)) results.replaceChildren(...want);
     btns.update();
   }
@@ -1116,43 +1301,73 @@ function agentLimit(onchange) {
 }
 
 function newTaskDialog() {
-  if (!S.projects.length) return linkDialog();
+  const NEW = '+new';
+  const canMake = serverHas(6);
+  if (!S.projects.length && !canMake) return linkDialog();
   const active = sortedProjects().filter((p) => p.status === 'active');
   const projects = active.length ? active : S.projects;
-  const start = projects.some((p) => p.id === ui.filter) ? ui.filter : projects[0].id;
+  const start = !projects.length ? NEW : projects.some((p) => p.id === ui.filter) ? ui.filter : projects[0].id;
   const panel = convoPanel({ linkable: true });
-  const project = select(sortedProjects().map((p) => [p.id, p.name]), start, (v) => panel.show(v));
+  const project = select([...sortedProjects().map((p) => [p.id, p.name]), canMake && [NEW, '+ New empty project…']].filter(Boolean), start, (v) => pickProject(v));
   const title = h('input', { type: 'text', placeholder: 'Short name for the task' });
   const desc = h('textarea', { rows: 5, placeholder: 'What to change, where, and how to tell it worked.' });
   const mode = select(MODES_SHORT, 'plan', () => {});
+  // A project that does not exist yet: the dashboard makes an empty folder for it.
+  const newName = h('input', { type: 'text', placeholder: 'For example: Invoice Maker', spellcheck: false });
+  const newParent = h('input', { type: 'text', value: S.meta.suggestRoot || S.meta.home || '', spellcheck: false });
+  const newGit = h('input', { type: 'checkbox', checked: true });
+  const browse = h('button', { class: 'btn', onclick: async () => {
+    browse.disabled = true;
+    try { const r = await api('POST', '/api/pick-folder'); if (r.path) newParent.value = r.path; } finally { browse.disabled = false; }
+  } }, 'Browse…');
+  const copy = h('input', { type: 'checkbox' });
+  const newBox = h('div', { class: 'new-project stack tight', hidden: true },
+    h('div', { class: 'row two' }, field('Name of the new project', newName), field('Make its folder inside', h('div', { class: 'path-row' }, newParent, browse))),
+    h('label', { class: 'cp-link' }, newGit, 'Start a git repository in it, so the board can show what each task changed'),
+    h('p', { class: 'hint' }, 'This makes one empty folder with that name. Choose "Edit files" below if the agent should build something in it.'));
+  function pickProject(v) {
+    newBox.hidden = v !== NEW;
+    if (v === NEW) { mode.value = 'edit'; newName.focus(); } else panel.show(v);
+  }
   const model = select(modelOptions(), '', () => {});
   const priority = select(PRIORITIES, 'normal', () => {});
   const budget = budgetInput(0, () => {});
   const create = async (run) => {
     if (!title.value.trim()) { title.focus(); return toast('Give the task a title.'); }
-    const t = await api('POST', '/api/tasks', { projectId: project.value, title: title.value, description: desc.value, mode: mode.value, model: model.value, priority: priority.value, budget: Number(budget.value) || 0, run });
+    const fresh = project.value === NEW;
+    if (fresh) {
+      if (!newName.value.trim()) { newName.focus(); return toast('Give the new project a name.'); }
+      const p = await api('POST', '/api/projects/new', { name: newName.value, parent: newParent.value, git: newGit.checked });
+      // It exists now: choose it, so another try does not make it twice.
+      project.append(h('option', { value: p.id }, p.name));
+      project.value = p.id;
+      newBox.hidden = true;
+    }
+    const t = await api('POST', '/api/tasks', { projectId: project.value, title: title.value, description: desc.value, mode: mode.value, model: model.value, priority: priority.value, budget: Number(budget.value) || 0, copy: copy.checked && mode.value === 'edit', run });
     for (const sessionId of panel.linked) await api('POST', `/api/tasks/${t.id}/link`, { sessionId }).catch(() => {});
     closeDialog();
+    if (fresh) { toast(`Made the project "${newName.value.trim()}" and added the task.`); setFilter(t.projectId, true); await refresh(true).catch(() => {}); return; }
     refreshSoon();
   };
   showDialog('New task', [
     h('div', { class: 'split' },
       h('div', { class: 'stack tight' },
         h('div', { class: 'row two' }, field('Project', project), field('Title', title)),
+        newBox,
         field('What should be done', desc),
         h('div', { class: 'row four' }, field('Agent may', mode), field('Model', model), field('Priority', priority), field('Limit ($)', budget)),
+        serverHas(7) && h('label', { class: 'cp-link' }, copy, 'Work in a separate copy of the project (for Edit files), so other agents can edit it at the same time'),
         h('p', { class: 'hint' }, 'Plan only changes nothing. Edit files does the work but never commits.')),
       panel.el),
   ], [
     h('button', { class: 'link', onclick: () => bulkDialog() }, 'Several tasks →'),
     h('span', { class: 'spacer' }),
     cancelBtn(),
-    h('button', { class: 'btn', onclick: () => create(false) }, 'Add to board'),
-    h('button', { class: 'btn primary', onclick: () => create(true) }, 'Add and run agent'),
+    h('button', { class: 'btn', onclick: () => create(false).catch(() => {}) }, 'Add to board'),
+    h('button', { class: 'btn primary', onclick: () => create(true).catch(() => {}) }, 'Add and run agent'),
   ]);
   $('#dlg').style.width = 'min(920px, calc(100vw - 32px))';
-  panel.show(start);
-  title.focus();
+  if (start === NEW) pickProject(NEW); else { panel.show(start); title.focus(); }
 }
 
 // Reads the "several tasks" box: one task per line, projects tagged with
@@ -1276,13 +1491,18 @@ function bulkDialog() {
     follow();
   };
 
+  const inOrder = h('input', { type: 'checkbox' });
+  const copies = h('input', { type: 'checkbox' });
   async function create(run) {
     addBtn.disabled = runBtn.disabled = true;
     let made = 0;
+    const last = {}; // project id -> the task added before, for "one after another"
     try {
       for (const t of parsed) {
         for (const projectId of t.projectIds) {
-          await api('POST', '/api/tasks', { projectId, title: t.title, description: t.description, mode: modeOf(t), model: model.value, priority: priority.value, run });
+          const added = await api('POST', '/api/tasks', { projectId, title: t.title, description: t.description, mode: modeOf(t), model: model.value, priority: priority.value, run,
+            copy: copies.checked && modeOf(t) === 'edit', after: inOrder.checked ? last[projectId] || '' : '' });
+          last[projectId] = added.id;
           made++;
         }
       }
@@ -1302,6 +1522,9 @@ function bulkDialog() {
         h('p', { class: 'hint' }, 'One task per line. Tag with @Name (several tags give the task to each project). Indent a line for details. To let one task edit files and another only plan, add !edit or !plan to its line, or click its label in the list below.'),
         preview,
         h('div', { class: 'row four' }, field('Untagged lines go to', fallback), field('Agent may (default)', mode), field('Model', model), field('Priority', priority)),
+        serverHas(7) && h('div', { class: 'sug-pickers' },
+          h('label', { class: 'cp-link' }, inOrder, 'In each project, run them one after another'),
+          h('label', { class: 'cp-link' }, copies, 'Separate copy for each editing task')),
         h('div', { class: 'row agents' }, field('Agents at once', limit.pick), limit.note)),
       panel.el),
   ], [
@@ -1388,6 +1611,23 @@ function projectDialog(pid) {
   const notes = h('textarea', { rows: 4, value: p.notes || '', placeholder: 'Anything you want to remember about this project.' });
   const taskCount = S.tasks.filter((t) => t.projectId === p.id).length;
 
+  // Tags: typed with commas between them. The chips below add a tag another
+  // project already has, or this project's kind, with one click.
+  const tags = h('input', { type: 'text', value: tagsOf(p).join(', '), placeholder: 'For example: Android, Client work', spellcheck: false });
+  const typedTags = () => tags.value.split(',').map((x) => x.trim()).filter(Boolean);
+  const tagIdeas = h('div', { class: 'tagbar' });
+  const showTagIdeas = () => {
+    const have = { tags: typedTags() };
+    const ideas = [...allTags().map(([x]) => x), info.exists && info.type !== 'Folder' ? info.type : null]
+      .filter((x, i, all) => x && !hasTag(have, x) && all.findIndex((y) => y && y.toLowerCase() === x.toLowerCase()) === i);
+    tagIdeas.hidden = !ideas.length;
+    tagIdeas.replaceChildren(h('span', { class: 'hint' }, 'Add:'), ...ideas.map((x) => h('button', {
+      class: 'chip tag', type: 'button', onclick: () => { tags.value = [...typedTags(), x].join(', '); showTagIdeas(); },
+    }, x)));
+  };
+  tags.addEventListener('input', showTagIdeas);
+  showTagIdeas();
+
   const facts = [['Kind', info.exists ? info.type : 'Folder missing']];
   if (info.git) {
     facts.push(['Branch', info.git.branch + (info.git.ahead ? ` (${info.git.ahead} not pushed)` : '')]);
@@ -1413,6 +1653,8 @@ function projectDialog(pid) {
     field('Name', name),
     field('Folder', folder),
     h('div', { class: 'row' }, field('Status', status), field('Deadline', deadline)),
+    serverHas(9) && field('Tags (commas between them): group similar projects, then filter by tag in the side list', tags),
+    serverHas(9) && tagIdeas,
     field('Notes', notes),
     h('p', { class: 'hint' }, 'Unlinking removes the project and its tasks from this dashboard only. The folder itself is never touched.'),
   ], [
@@ -1422,6 +1664,7 @@ function projectDialog(pid) {
     h('button', { class: 'btn primary', onclick: async () => {
       const body = { name: name.value, status: status.value, deadline: deadline.value, notes: notes.value };
       if (folder.value.trim() !== p.path) body.path = folder.value;
+      if (serverHas(9)) body.tags = typedTags();
       await api('PATCH', `/api/projects/${p.id}`, body);
       closeDialog();
       refresh(true);
@@ -1435,7 +1678,14 @@ function settingsDialog() {
   const model = select(modelOptions(true), S.settings.defaultModel || '', () => {});
   const autoMax = select(TIERS.map((x) => [x[0], modelLabel(x[2])]), S.settings.autoMax || 'max', () => {});
   const bin = h('input', { type: 'text', value: S.settings.claudePath || '', placeholder: S.meta.claude || 'Not found: paste the full path', spellcheck: false });
+  const theme = select([['', 'Same as this Mac'], ['light', 'Light'], ['dark', 'Dark']], themeChoice(), (v) => setTheme(v));
+  const notifyBox = h('input', { type: 'checkbox', checked: S.settings.notify !== false });
+  const ntfy = h('input', { type: 'text', value: S.settings.ntfyTopic || '', placeholder: 'Empty: no phone notifications', spellcheck: false });
   showDialog('Settings', [
+    field('Theme', theme),
+    serverHas(7) && h('label', { class: 'cp-link' }, notifyBox, 'Show a Mac notification when a task finishes, needs your OK, or the limit runs out'),
+    serverHas(7) && field('Phone notifications: your topic name on ntfy.sh', ntfy),
+    serverHas(7) && h('p', { class: 'hint' }, 'For the phone, install the free ntfy app, subscribe to a topic name only you know, and type it here. The task id, project name and title are then sent to ntfy.sh, an outside service.'),
     field('Agents running at the same time', max),
     limit.note,
     h('p', { class: 'hint' }, 'Extra tasks wait in the queue. Two agents never edit the same project at once, so there is no gain in going above your number of projects.'),
@@ -1446,7 +1696,7 @@ function settingsDialog() {
   ], [
     cancelBtn(),
     h('button', { class: 'btn primary', onclick: async () => {
-      await api('PATCH', '/api/settings', { maxAgents: Number(max.value), defaultModel: model.value, claudePath: bin.value, ...(v2() ? { autoMax: autoMax.value } : {}) });
+      await api('PATCH', '/api/settings', { maxAgents: Number(max.value), defaultModel: model.value, claudePath: bin.value, ...(v2() ? { autoMax: autoMax.value } : {}), ...(serverHas(7) ? { notify: notifyBox.checked, ntfyTopic: ntfy.value } : {}) });
       closeDialog();
       refresh();
     } }, 'Save'),
@@ -1565,11 +1815,34 @@ function spendChart(days) {
     h('div', { class: 'chart-x' }, h('span', null, dayLabel(days[0].at)), h('span', null, dayLabel(days[7].at)), h('span', null, 'Today')));
 }
 
+// Asks before anything leaves this Mac: the dashboard commits the copy's
+// changes as you, pushes the branch and opens the pull request.
+function pullRequestDialog(t) {
+  const title = h('input', { type: 'text', value: t.title });
+  const body = h('textarea', { rows: 8, value: [t.description, t.report ? `What was done:\n${t.report.slice(0, 3000)}` : ''].filter(Boolean).join('\n\n') });
+  const go = h('button', { class: 'btn primary', onclick: async () => {
+    go.disabled = true;
+    go.textContent = 'Working…';
+    try {
+      const r = await api('POST', `/api/tasks/${t.id}/copy`, { do: 'pr', title: title.value, body: body.value });
+      closeDialog();
+      toast(`Pull request opened: ${r.work.pr}`);
+    } catch { go.disabled = false; go.textContent = 'Commit, push and open'; }
+    refreshSoon();
+  } }, 'Commit, push and open');
+  showDialog(`Pull request for ${t.id}`, [
+    field('Title (also the commit message)', title),
+    field('Description', body),
+    h('p', { class: 'hint' }, `This commits the changes in the copy under your name, pushes the branch ${t.work.branch} to GitHub and opens a pull request. Nothing is merged. Read the Changes first.`),
+  ], [cancelBtn(), go]);
+  $('#dlg').style.width = 'min(640px, calc(100vw - 32px))';
+}
+
 async function setUsageMode(mode) {
   try { await api('PATCH', '/api/settings', { usageMode: mode }); } catch { /* the error is already shown */ }
   await refresh().catch(() => {});
-  const m = USAGE_MODES.find((x) => x[0] === usageMode());
-  toast(`Usage mode: ${m[1]}. It applies to agents that start from now on.`);
+  const m = USAGE_MODES.find((x) => x[0] === chosenMode());
+  toast(steppedDown() ? `Usage mode: ${m[1]}. ${steppedNote()}` : `Usage mode: ${m[1]}. It applies to agents that start from now on.`);
 }
 
 // Reads your Claude limits afresh (one tiny Haiku call) and reloads the
@@ -1619,7 +1892,8 @@ function usageDialog(draft = {}) {
   const daily = h('input', { type: 'number', min: 0, step: 1, value: typed('daily', s.dailyBudget), placeholder: 'No limit' });
   const perRun = h('input', { type: 'number', min: 0, step: 0.5, value: typed('perRun', s.taskBudget), placeholder: usageMode() === 'saver' ? `Saver: ${money(u.saverBudget)}` : 'No limit' });
   const hold = h('input', { type: 'number', min: 0, max: 100, step: 5, value: typed('hold', s.holdPercent), placeholder: 'Never' });
-  const redraw = () => usageDialog({ daily: daily.value, perRun: perRun.value, hold: hold.value });
+  const saverAt = h('input', { type: 'number', min: 0, max: 100, step: 5, value: typed('saverAt', u.autoSaver), placeholder: 'Never' });
+  const redraw = () => usageDialog({ daily: daily.value, perRun: perRun.value, hold: hold.value, saverAt: saverAt.value });
   // For when you know the limits changed (a reset, or heavy use in VS Code).
   const refreshBtn = serverHas(3) && h('button', { class: 'btn small', title: 'Read your Claude limits again now', onclick: async () => {
     if (await refreshUsage(refreshBtn) && $('#dlg').open && $('#dlg').contains(refreshBtn)) redraw();
@@ -1627,10 +1901,11 @@ function usageDialog(draft = {}) {
 
   const modeBox = serverHas(5) && h('div', null,
     h('div', { class: 'sect-title' }, 'Usage mode'),
-    h('div', { class: 'modes' }, USAGE_MODES.map(([key, label, about]) => h('label', { class: `mode-row${usageMode() === key ? ' on' : ''}` },
-      h('input', { type: 'radio', name: 'usage-mode', checked: usageMode() === key, onchange: async () => { await setUsageMode(key); redraw(); } }),
+    h('div', { class: 'modes' }, USAGE_MODES.map(([key, label, about]) => h('label', { class: `mode-row${chosenMode() === key ? ' on' : ''}` },
+      h('input', { type: 'radio', name: 'usage-mode', checked: chosenMode() === key, onchange: async () => { await setUsageMode(key); redraw(); } }),
       h('strong', null, label),
       h('span', { class: 'hint' }, about)))),
+    steppedDown() && h('p', { class: 'hint', style: 'margin-top:8px' }, h('strong', null, steppedNote())),
     h('p', { class: 'hint', style: 'margin-top:8px' }, 'In Saver and Balanced, agents also start by how much of your 5-hour limit they are likely to take, not just by how many are running: a new one starts only if it fits under the pause level below, next to those already running. In every mode, an agent that a limit cuts off waits for the reset and then continues by itself.'));
   const typical = serverHas(5) && u.typical && h('div', null,
     h('div', { class: 'sect-title' }, 'What one agent run usually takes'),
@@ -1668,15 +1943,155 @@ function usageDialog(draft = {}) {
         field('Daily spend limit ($)', daily),
         field('Spend limit for one agent run ($)', perRun)),
       field('Pause new agents when a plan limit is this full (%)', hold),
+      serverHas(8) && field('Switch to Saver by itself when the 5-hour limit is this full (%)', saverAt),
       h('p', { class: 'hint' }, 'Leave a box empty for no limit. When the daily limit or the plan-limit pause is hit, queued tasks wait and start again by themselves; running agents finish. A run that hits its own limit stops and lands in Needs review. Dollar amounts are what the runs would cost at API prices. On a Claude subscription you are not billed these amounts; there the plan limits are what matter.')),
   ], [
     cancelBtn(),
     h('button', { class: 'btn primary', onclick: async () => {
-      await api('PATCH', '/api/settings', { dailyBudget: Number(daily.value) || 0, taskBudget: Number(perRun.value) || 0, holdPercent: Number(hold.value) || 0 });
+      await api('PATCH', '/api/settings', { dailyBudget: Number(daily.value) || 0, taskBudget: Number(perRun.value) || 0, holdPercent: Number(hold.value) || 0, ...(serverHas(8) ? { autoSaver: Number(saverAt.value) || 0 } : {}) });
       closeDialog();
       refresh();
     } }, 'Save'),
   ]);
+}
+
+// ---------------------------------------------------------------- plan a run
+
+const share = (v) => (v > 0 && v < 1 ? 'under 1%' : `${Math.round(v)}%`);
+function roughTime(ms) {
+  const min = Math.max(1, Math.round(ms / 60000));
+  return min < 60 ? `${min} min` : `${Math.floor(min / 60)} h ${String(min % 60).padStart(2, '0')} min`;
+}
+
+// Shows what the open tasks of each project are likely to take of the
+// 5-hour limit, how many projects fit in what is free, and queues the ticked
+// ones to run one project after another.
+// plan: { order: [project ids], on: Set of ticked ids }, kept across redraws.
+function planDialog(plan) {
+  const f = S.forecast;
+  const rows = new Map(f.projects.filter((r) => S.projects.some((p) => p.id === r.id)).map((r) => [r.id, r]));
+  const free = Math.max(0, f.free);
+  // Smallest first: that way the most projects get finished.
+  const smallestFirst = () => [...rows.values()].sort((a, b) => a.points - b.points).map((r) => r.id);
+  const mostThatFit = () => {
+    const order = smallestFirst();
+    const on = new Set();
+    let sum = 0;
+    for (const id of order) {
+      if (sum + rows.get(id).points > free) break;
+      sum += rows.get(id).points;
+      on.add(id);
+    }
+    if (!on.size && order.length) on.add(order[0]);
+    return { order, on };
+  };
+  if (!plan) plan = mostThatFit();
+  plan.order = [...plan.order.filter((id) => rows.has(id)), ...smallestFirst().filter((id) => !plan.order.includes(id))];
+  const redraw = () => planDialog(plan);
+  const name = (id) => S.projects.find((p) => p.id === id).name;
+
+  const picked = plan.order.filter((id) => plan.on.has(id));
+  const sum = (key) => picked.reduce((n, id) => n + rows.get(id)[key], 0);
+  const need = sum('points');
+  let run = 0;
+  let fitCount = 0;
+  const fits = new Map(); // ticked project -> does it still fit, counting those before it
+  for (const id of picked) {
+    run += rows.get(id).points;
+    fits.set(id, run <= free);
+    if (run <= free) fitCount += 1;
+  }
+
+  const move = (id, by) => {
+    const i = plan.order.indexOf(id);
+    const j = i + by;
+    if (j < 0 || j >= plan.order.length) return;
+    [plan.order[i], plan.order[j]] = [plan.order[j], plan.order[i]];
+    redraw();
+  };
+  const table = h('div', { class: 'md' }, h('div', { class: 'table' }, h('table', { class: 'usage-table plan-table' },
+    h('tr', null, ['Project', 'Open tasks', 'Of the 5-hour limit', 'Usage', 'Agent time', '', 'Order'].map((c) => h('th', null, c))),
+    plan.order.map((id, i) => {
+      const r = rows.get(id);
+      const on = plan.on.has(id);
+      const models = TIERS.filter((x) => r.models[x[2]]).map((x) => `${r.models[x[2]]} ${MODEL_NAME[x[2]]}`).join(', ');
+      return h('tr', { class: on ? '' : 'off' },
+        h('td', null, h('label', { class: 'cp-link' },
+          h('input', { type: 'checkbox', checked: on, onchange: (e) => { if (e.target.checked) plan.on.add(id); else plan.on.delete(id); redraw(); } }), name(id))),
+        h('td', null, String(r.tasks), h('div', { class: 'hint' }, models)),
+        h('td', null, `about ${share(r.points)}`),
+        h('td', null, money(r.cost)),
+        h('td', null, roughTime(r.ms)),
+        h('td', null, on && h('span', { class: `chip ${fits.get(id) ? 'fits' : 'high'}` }, fits.get(id) ? 'Fits' : 'Does not fit')),
+        h('td', { class: 'plan-move' },
+          h('button', { class: 'btn small ghost', disabled: i === 0, title: 'Run earlier', 'aria-label': `Run ${name(id)} earlier`, onclick: () => move(id, -1) }, '↑'),
+          h('button', { class: 'btn small ghost', disabled: i === plan.order.length - 1, title: 'Run later', 'aria-label': `Run ${name(id)} later`, onclick: () => move(id, 1) }, '↓')));
+    }))));
+
+  // The limit as one bar: used, kept for running agents, this plan, and the pause level.
+  const fitPart = Math.min(need, free);
+  const overPart = Math.max(0, Math.min(need - fitPart, 100 - f.used - f.reserved - fitPart));
+  const seg = (cls, v) => v > 0.2 && h('span', { class: cls, style: `width:${Math.min(100, v)}%` });
+  const key = (cls, label) => h('span', null, h('i', { class: cls, style: `background:${{ used: 'var(--muted)', held: 'color-mix(in srgb, var(--muted) 50%, transparent)', fits: 'var(--ok)', over: 'var(--bad)' }[cls]}` }), label);
+  const bar = h('div', null,
+    h('div', { class: 'plan-bar', role: 'img', 'aria-label': `5-hour limit: ${Math.round(f.used)}% used, this plan needs about ${share(need)}, ${share(free)} is free` },
+      seg('used', f.used), seg('held', f.reserved), seg('fits', fitPart), seg('over', overPart),
+      f.ceiling < 100 && h('span', { class: 'stop', style: `left:${f.ceiling}%; height:100%` })),
+    h('div', { class: 'plan-key' },
+      key('used', `Used ${Math.round(f.used)}%`),
+      f.reserved > 0.5 && key('held', `Agents running now, about ${share(f.reserved)}`),
+      key('fits', `This plan, about ${share(need)}`),
+      need > free && key('over', 'More than is free'),
+      f.ceiling < 100 && h('span', null, `Line: new agents pause at ${f.ceiling}%`)));
+
+  const refreshBtn = h('button', { class: 'btn small', title: 'Read your Claude limits again now', onclick: async () => {
+    if (await refreshUsage(refreshBtn) && $('#dlg').open && $('#dlg').contains(refreshBtn)) redraw();
+  } }, 'Refresh');
+  const resets = f.resetsAt && new Date(f.resetsAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const now = f.resetsAt
+    ? `${share(free)} of your 5-hour limit is free for agents (${Math.round(f.used)}% used, resets ${resets}). Read ${ago(f.readAt)}.`
+    : f.readAt ? 'Your 5-hour limit has reset since it was last read, so it is counted as empty.'
+      : 'Your Claude limit has not been read yet, so it is counted as empty. Press Refresh for the real number.';
+
+  const tasks = sum('tasks');
+  let verdict = 'Tick the projects you want to run.';
+  if (picked.length) {
+    verdict = `${plural(picked.length, 'project')}, ${plural(tasks, 'task')}: about ${share(need)} of your 5-hour limit, ${money(sum('cost'))} of usage, about ${roughTime(sum('ms'))} of agent time. `;
+    if (need <= free) verdict += 'All of it should fit.';
+    else if (fitCount) verdict += `Only the first ${fitCount === 1 ? 'project fits' : `${fitCount} projects fit`}. The rest starts while there is room, waits for the reset, and then continues by itself.`;
+    else verdict += `That is more than is free. It starts anyway, waits for the reset${resets ? ` (${resets})` : ''} when the limit is full, and then continues by itself.`;
+  }
+  const guessed = [...rows.values()].reduce((n, r) => n + r.guessed, 0);
+  const week = limitState(S.usage && S.usage.limits && S.usage.limits.windows.seven_day);
+  const order = select([['project', 'One project after another'], ['mixed', 'Mixed: by priority and time only']], S.settings.queueOrder || 'project', async (v) => {
+    await api('PATCH', '/api/settings', { queueOrder: v });
+    await refresh();
+    redraw();
+  });
+  const todo = picked.reduce((n, id) => n + rows.get(id).todo, 0);
+
+  showDialog('Plan a run', [
+    h('div', { class: 'sect-head' }, h('p', { class: 'hint', style: 'margin:0' }, now), refreshBtn),
+    bar,
+    table,
+    h('div', { class: 'plan-sum' }, verdict),
+    h('div', { class: 'plan-btns' },
+      h('button', { class: 'btn small', onclick: () => planDialog(mostThatFit()) }, 'Pick the most that fit'),
+      h('button', { class: 'btn small', onclick: () => { plan.on = new Set(plan.order); redraw(); } }, 'Tick all'),
+      h('button', { class: 'btn small', onclick: () => { plan.on = new Set(); redraw(); } }, 'Untick all')),
+    field('How waiting tasks start', order),
+    h('p', { class: 'hint' }, 'With "One project after another", agents finish all waiting tasks of one project before they begin the next, so a limit that runs out does not leave every project half done. A second project starts next to the first only when both fit in what is free. Without an order from you, the smallest project goes first.'),
+    h('p', { class: 'hint' }, `These are rough estimates from your own past runs on each model (see Usage and budgets). They count the 5-hour limit only, and your own Claude sessions use the same limit.${guessed ? ` Auto has not looked at ${plural(guessed, 'task')} yet, so the model is a guess from the wording.` : ''}${week && !week.reset && week.pct >= 70 ? ` Your weekly limit is ${week.pct}% used, which can stop agents earlier.` : ''}`),
+  ], [
+    cancelBtn(),
+    h('button', { class: 'btn primary', disabled: !picked.length, onclick: async () => {
+      const r = await api('POST', '/api/run-projects', { projectIds: picked });
+      closeDialog();
+      toast(r.queued ? `${plural(r.queued, 'task')} queued, one project after another.` : 'Order saved for the waiting tasks.');
+      refresh().catch(() => {});
+    } }, todo ? `Run ${plural(todo, 'task')} in this order` : 'Use this order'),
+  ]);
+  $('#dlg').style.width = 'min(820px, calc(100vw - 32px))';
 }
 
 // ---------------------------------------------------------------- wiring
@@ -1685,6 +2100,10 @@ $('#btn-new').addEventListener('click', newTaskDialog);
 $('#btn-link').addEventListener('click', () => linkDialog());
 $('#btn-settings').addEventListener('click', settingsDialog);
 $('#btn-suggest').addEventListener('click', suggestDialog);
+$('#btn-plan').addEventListener('click', () => planDialog());
+$('#btn-theme').addEventListener('click', () => setTheme(themeNow() === 'dark' ? 'light' : 'dark'));
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', paintTheme);
+paintTheme();
 $('#usage-mode').addEventListener('change', (e) => setUsageMode(e.target.value));
 $('#dlg').addEventListener('close', () => { ui.onState = null; });
 $('#usage').addEventListener('click', () => usageDialog());

@@ -41,10 +41,19 @@ const TIERS = [
 const TIER_KEYS = TIERS.map((x) => x.key);
 // The page checks this number, so a page that is newer than the running
 // server can hide what the server cannot do yet.
-const API_VERSION = 5;
+const API_VERSION = 10;
+const REPEATS = { daily: 864e5, weekly: 7 * 864e5 };
+// Files a separate copy of a project needs but git does not track. They are
+// copied only when git ignores them, so they can never end up in a commit.
+const COPY_EXTRA = ['local.properties', '.env', '.env.local'];
 // How careful agents are with the Claude plan limit: see "usage modes" below.
 const USAGE_MODES = ['saver', 'balanced', 'full'];
+// Most agents at once in a mode (never above the number in Settings). Full power goes by Settings alone.
+const MODE_AGENTS = { saver: 1, balanced: 2 };
 const SAVER_RUN_BUDGET = 3; // dollars for one run in Saver, when you set no limit yourself
+// The order waiting tasks start in: 'project' finishes one project's tasks
+// before the next project begins, 'mixed' goes by priority and time alone.
+const QUEUE_ORDERS = ['project', 'mixed'];
 const MAX_LIMIT_RETRIES = 3; // times in a row a task may be cut off by a limit and continue by itself
 
 class HttpError extends Error {
@@ -60,13 +69,14 @@ let db = {
   // taskBudget and dailyBudget are in US dollars, 0 = no limit. holdPercent
   // pauses the queue when a Claude plan limit is that full, 0 = never.
   // autoMax is the strongest level the automatic model choice may pick.
-  settings: { maxAgents: 2, defaultModel: '', claudePath: '', taskBudget: 0, dailyBudget: 0, holdPercent: 90, autoMax: 'max', usageMode: 'full' },
+  settings: { maxAgents: 2, defaultModel: '', claudePath: '', taskBudget: 0, dailyBudget: 0, holdPercent: 90, autoMax: 'max', usageMode: 'full', autoSaver: 70, notify: true, ntfyTopic: '', queueOrder: 'project' },
   projects: [],
   tasks: [],
   spend: [],     // one entry per agent run: { at, taskId, projectId, cost, model }
   limits: null,  // last Claude plan limits an agent reported
   windows: {},   // per 5-hour window: how far agents pushed the limit, and what they spent
   defaultFamily: '', // the model Claude Code picks when a task names none
+  runOrder: [],  // project ids in the order you last chose in "Plan a run"
 };
 
 function load() {
@@ -247,7 +257,7 @@ function usage() {
     const run = typicalRun(fam, 'edit');
     return { family: fam, cost: run.cost, points: run.cost * rate, runs: run.runs || 0 };
   });
-  return { totals, byProject, days, limits: db.limits, hold: holdReason(), mode: usageMode(), saverBudget: SAVER_RUN_BUDGET, rate, typical };
+  return { totals, byProject, days, limits: db.limits, hold: holdReason(), mode: usageMode(), chosen: chosenMode(), stepped: steppedDown(), autoSaver: autoSaverAt(), agentCap: agentCap(), saverBudget: SAVER_RUN_BUDGET, rate, typical };
 }
 
 function recordSpend(t, result) {
@@ -280,7 +290,12 @@ function recordLimits(ev, fromAgent) {
   const key = String(w.resetsAt);
   const win = db.windows[key] || (db.windows[key] = { gain: 0, cost: 0, lastU: w.utilization, agentAt: 0 });
   if (fromAgent) {
-    if (now - win.agentAt < 10 * 60000 && w.utilization > win.lastU) win.gain += w.utilization - win.lastU;
+    if (now - win.agentAt < 10 * 60000 && w.utilization > win.lastU) {
+      win.gain += w.utilization - win.lastU;
+      // Your own Claude sessions push the same limit. A window where they
+      // were busy too says less about what agent work costs.
+      if (ownSessionsActiveSince(win.agentAt)) win.mixed = true;
+    }
     win.agentAt = now;
   }
   win.lastU = w.utilization;
@@ -729,9 +744,21 @@ async function chooseModel(t, p, bin) {
 //   balanced  "Default" means Auto.
 //   full      Nothing is held back: "Default" is Claude Code's own model.
 // Saver and Balanced also start agents by how much of the limit they are
-// likely to take, not just by how many are running.
+// likely to take, not just by how many are running. Saver runs one agent at
+// a time and Balanced two.
+// Whatever mode you chose, the dashboard acts as Saver while the 5-hour
+// limit is at or above settings.autoSaver percent (0 = never), and goes back
+// to your mode by itself when the limit resets.
 
-const usageMode = () => (USAGE_MODES.includes(db.settings.usageMode) ? db.settings.usageMode : 'full');
+const chosenMode = () => (USAGE_MODES.includes(db.settings.usageMode) ? db.settings.usageMode : 'full');
+const autoSaverAt = () => (db.settings.autoSaver == null ? 70 : Math.min(100, Math.max(0, Number(db.settings.autoSaver) || 0)));
+function steppedDown() {
+  const at = autoSaverAt();
+  const w = db.limits && db.limits.windows.five_hour;
+  return chosenMode() !== 'saver' && at > 0 && Boolean(w) && w.resetsAt > Date.now() && w.utilization * 100 >= at;
+}
+const usageMode = () => (steppedDown() ? 'saver' : chosenMode());
+const agentCap = () => Math.min(db.settings.maxAgents, MODE_AGENTS[usageMode()] || Infinity);
 
 // The model choice a task runs with: its own, else the default.
 function wantedModel(t) {
@@ -795,22 +822,80 @@ function typicalRun(fam, runMode) {
 // How many points (percent) of the 5-hour limit one dollar of agent work
 // takes on your plan. Learned from the readings; 2 until there is enough.
 function pointsPerDollar() {
+  const usable = Object.values(db.windows).filter((w) => w.cost >= 2 && w.gain > 0);
+  // Windows where only agents were working are the cleaner measure.
+  const clean = usable.filter((w) => !w.mixed);
   let gain = 0;
   let cost = 0;
-  for (const w of Object.values(db.windows)) {
-    if (!(w.cost >= 2) || !(w.gain > 0)) continue;
+  for (const w of clean.length ? clean : usable) {
     gain += w.gain * 100;
     cost += w.cost;
   }
   return cost ? Math.min(30, Math.max(0.2, gain / cost)) : 2;
 }
 
-function estimate(t) {
-  const fam = family(runModel(t)) || db.defaultFamily || 'fable';
-  const run = typicalRun(fam, editing(t) ? 'edit' : 'plan');
+// True when a Claude conversation that is not a dashboard agent's was
+// written to since the given time. Looked up at most every 20 seconds.
+let ownSeen = { at: 0, latest: 0 };
+function ownSessionsActiveSince(ts) {
+  if (Date.now() - ownSeen.at > 20000) {
+    const mine = new Set(db.tasks.filter((t) => t.sessionId && !t.ide).map((t) => `${t.sessionId}.jsonl`));
+    let latest = 0;
+    try {
+      for (const d of fs.readdirSync(CLAUDE_PROJECTS)) {
+        let names = [];
+        try { names = fs.readdirSync(path.join(CLAUDE_PROJECTS, d)); } catch { continue; }
+        for (const n of names) {
+          if (!n.endsWith('.jsonl') || mine.has(n)) continue;
+          try { latest = Math.max(latest, fs.statSync(path.join(CLAUDE_PROJECTS, d, n)).mtimeMs); } catch { /* gone */ }
+        }
+      }
+    } catch { /* nothing saved */ }
+    ownSeen = { at: Date.now(), latest };
+  }
+  return ownSeen.latest > ts;
+}
+
+// The model a task will most likely run on. An Auto task that has not been
+// sized yet goes by the word rules, which cost nothing.
+function likelyFamily(t) {
+  const known = family(runModel(t));
+  if (known) return known;
+  if (wantedModel(t) === 'auto') {
+    return capTier(t.kind === 'scan' ? (t.scan && t.scan.code ? 'optimized' : 'efficient') : guessTier(t)).model;
+  }
+  return db.defaultFamily || 'fable';
+}
+
+// What one run of this task is likely to take. memo (optional) saves looking
+// up the same model twice when many tasks are estimated together.
+function estimate(t, memo) {
+  const fam = likelyFamily(t);
+  const key = `${fam}/${editing(t) ? 'edit' : 'plan'}`;
+  const run = (memo && memo[key]) || typicalRun(fam, editing(t) ? 'edit' : 'plan');
+  if (memo) memo[key] = run;
   const cap = runBudget(t);
   const cost = cap > 0 ? Math.min(run.cost, cap) : run.cost;
-  return { cost, ms: run.ms, points: cost * pointsPerDollar() };
+  return { cost, ms: run.ms, points: cost * pointsPerDollar(), family: fam };
+}
+
+// How much of the 5-hour limit is free for new agents, in points (percent):
+// the pause level, minus what is used, minus what the running agents will
+// still take. The part they already used is in the reading, so their share
+// shrinks as they get older.
+function limitRoom() {
+  const now = Date.now();
+  const w = db.limits && db.limits.windows.five_hour;
+  const live = Boolean(w) && w.resetsAt > now;
+  const used = live ? w.utilization * 100 : 0;
+  const ceiling = db.settings.holdPercent > 0 ? db.settings.holdPercent : 100;
+  let reserved = 0;
+  for (const [id, st] of running) {
+    const other = findTask(id);
+    if (!other || !st.est) continue;
+    reserved += st.est.points * Math.max(0.2, 1 - (now - other.startedAt) / st.est.ms);
+  }
+  return { used, ceiling, reserved, free: ceiling - used - reserved, resetsAt: live ? w.resetsAt : 0, readAt: db.limits ? db.limits.at : 0 };
 }
 
 // Is there room in the 5-hour limit to start this task next to the agents
@@ -818,22 +903,78 @@ function estimate(t) {
 // with nothing else running is never held here: the plain pause covers that.
 function roomFor(t) {
   if (usageMode() === 'full' || !running.size) return null;
-  const now = Date.now();
-  const w = db.limits && db.limits.windows.five_hour;
-  const used = w && w.resetsAt > now ? w.utilization * 100 : 0;
-  const ceiling = db.settings.holdPercent > 0 ? db.settings.holdPercent : 100;
-  // What the running agents will still take. The part they already used is
-  // in the reading, so their share shrinks as they get older.
-  let reserved = 0;
-  for (const [id, st] of running) {
-    const other = findTask(id);
-    if (!other || !st.est) continue;
-    reserved += st.est.points * Math.max(0.2, 1 - (now - other.startedAt) / st.est.ms);
-  }
   const need = estimate(t).points;
-  const free = ceiling - used - reserved;
+  const free = limitRoom().free;
   if (need <= free) return null;
   return `Waiting for room in your 5-hour limit: needs about ${Math.max(1, Math.round(need))}%, ${Math.max(0, Math.floor(free))}% is free`;
+}
+
+// ---------------------------------------------------------------- project by project
+//
+// With settings.queueOrder 'project', waiting tasks start one project after
+// another, so a limit that runs out leaves finished projects and untouched
+// ones, not a little done everywhere. The order: a project that agents are
+// already working on, then the order you chose in "Plan a run", then the
+// project that needs the least of the limit (so the most projects get done).
+// A second project starts next to the first only when both fit in what is
+// free of the 5-hour limit.
+
+let focusProject = null; // the project the last agent was started for
+
+// True for a waiting task that cannot start until you do something: the
+// task it runs after is not queued, running or finished well.
+function waitsOnYou(t) {
+  const first = t.after && !t.force ? findTask(t.after) : null;
+  if (!first || first.status === 'done' || first.status === 'queued' || first.status === 'running') return false;
+  return !(first.status === 'review' && first.outcome === 'ok' && first.phase !== 'plan');
+}
+
+// Gives each project with waiting tasks its place in line and what its
+// waiting tasks need, as a Map of project id to { rank, need, upTo, left }.
+function projectLine(queued) {
+  const memo = {};
+  const rows = new Map();
+  for (const t of queued) {
+    if (waitsOnYou(t) || (stillCut(t) && !t.force)) continue;
+    const r = rows.get(t.projectId) || { id: t.projectId, need: 0, left: 0, first: Infinity };
+    r.need += estimate(t, memo).points;
+    r.left += 1;
+    r.first = Math.min(r.first, t.queuedAt || 0);
+    rows.set(t.projectId, r);
+  }
+  if (focusProject && !rows.has(focusProject)) focusProject = null; // that project has nothing waiting any more
+  const busy = new Set([...running.keys()].map((id) => (findTask(id) || {}).projectId));
+  const chosen = Array.isArray(db.runOrder) ? db.runOrder : [];
+  const place = (id) => { const i = chosen.indexOf(id); return i < 0 ? chosen.length : i; };
+  const list = [...rows.values()].sort((a, b) => busy.has(b.id) - busy.has(a.id)
+    || (b.id === focusProject) - (a.id === focusProject)
+    || place(a.id) - place(b.id) || a.need - b.need || a.first - b.first);
+  let sum = 0;
+  list.forEach((r, i) => { r.rank = i; sum += r.need; r.upTo = sum; });
+  return rows;
+}
+
+// What the open tasks (To do and waiting) of every project are likely to
+// take, and how much of the 5-hour limit is free: the numbers behind
+// "Plan a run".
+function forecast() {
+  const memo = {};
+  const rows = new Map();
+  for (const t of db.tasks) {
+    if (t.status !== 'todo' && t.status !== 'queued') continue;
+    const r = rows.get(t.projectId) || { id: t.projectId, tasks: 0, todo: 0, queued: 0, points: 0, cost: 0, ms: 0, guessed: 0, models: {} };
+    const e = estimate(t, memo);
+    r.tasks += 1;
+    r[t.status] += 1;
+    r.points += e.points;
+    r.cost += e.cost;
+    r.ms += e.ms;
+    r.models[e.family] = (r.models[e.family] || 0) + 1;
+    // The model is not known yet: Auto has not looked at the task.
+    if (!family(runModel(t))) r.guessed += 1;
+    rows.set(t.projectId, r);
+  }
+  return { ...limitRoom(), rate: pointsPerDollar(), runOrder: Array.isArray(db.runOrder) ? db.runOrder : [], projects: [...rows.values()] };
 }
 
 const LIMIT_NAME = { five_hour: '5-hour', seven_day: 'weekly' };
@@ -868,6 +1009,7 @@ function parkForLimit(t, st) {
   t.assignee = { kind: 'agent', name: '' };
   t.pendingFollowUp = 'You were cut off by a usage limit, which has now reset. Continue the task from where you stopped.';
   addLog(t, 'status', `Cut off by your Claude ${name} limit. It continues by itself after the reset (${clockTime(lim.resetsAt, lim.type !== 'five_hour')}).`);
+  notify(`Your Claude ${name} limit is used up. Agents continue by themselves after ${clockTime(lim.resetsAt, lim.type !== 'five_hour')}.`);
   infoCache.delete(t.projectId);
   changed();
   pump();
@@ -1036,6 +1178,68 @@ function readSuggestions(obj, run) {
   return { summary: clip(obj.summary, 4000), suggestions };
 }
 
+// ---------------------------------------------------------------- notifications
+
+// A Mac notification (and a phone one through ntfy.sh, if you set a topic)
+// when something needs you. Several at once are folded into one.
+const notes = [];
+let noteTimer = null;
+function notify(textLine) {
+  if (!db.settings.notify) return;
+  notes.push(textLine);
+  if (!noteTimer) noteTimer = setTimeout(sendNotes, 2500);
+}
+function sendNotes() {
+  noteTimer = null;
+  const list = notes.splice(0);
+  if (!list.length) return;
+  const body = list.length === 1 ? list[0] : `${list.length} updates. ${list.slice(0, 3).join(' · ')}${list.length > 3 ? ' · …' : ''}`;
+  execFile('osascript', ['-e', `display notification ${JSON.stringify(body.slice(0, 300))} with title "Project Dashboard"`], () => {});
+  const topic = db.settings.ntfyTopic;
+  if (topic) fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, { method: 'POST', body, headers: { Title: 'Project Dashboard' } }).catch(() => {});
+}
+
+// ---------------------------------------------------------------- a separate copy of the project for one task
+
+// With "separate copy" on, an editing task works in its own git worktree on
+// its own branch, next to the project. Several agents can then edit one
+// project at the same time, and the result can go back as uncommitted
+// changes ("Apply to project") or as a pull request.
+const workDir = (t, p) => (t.work && fs.existsSync(t.work.dir) ? t.work.dir : p.path);
+const git = (dir, args, opts) => sh('git', ['-C', dir, ...args], { timeout: 60000, maxBuffer: 64e6, ...opts });
+
+async function makeCopy(t, p) {
+  const head = await git(p.path, ['rev-parse', 'HEAD']);
+  if (!head.ok) throw new Error('A separate copy needs a git repository with at least one commit. Turn "separate copy" off for this task, or commit once in the project.');
+  const slug = t.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'task';
+  const branch = `dashboard/${t.id.toLowerCase()}-${slug}`;
+  const dir = path.join(path.dirname(p.path), '.dashboard-copies', `${path.basename(p.path)}-${t.id}`);
+  fs.mkdirSync(path.dirname(dir), { recursive: true });
+  const made = await git(p.path, ['worktree', 'add', '-b', branch, dir, 'HEAD']);
+  if (!made.ok) throw new Error(`Could not make the separate copy: ${made.err.trim().split('\n').pop()}`);
+  for (const name of COPY_EXTRA) {
+    const from = path.join(p.path, name);
+    if (!fs.existsSync(from)) continue;
+    const ignored = await git(p.path, ['check-ignore', '-q', name]);
+    if (ignored.ok) try { fs.copyFileSync(from, path.join(dir, name)); } catch { /* not needed enough to fail */ }
+  }
+  t.work = { dir: fs.realpathSync(dir), branch, base: head.out.trim() };
+  addLog(t, 'status', `Working in a separate copy on branch ${branch}`);
+}
+
+async function removeCopy(t, p) {
+  const w = t.work;
+  if (!w) return;
+  if (p && fs.existsSync(p.path)) {
+    await git(p.path, ['worktree', 'remove', '--force', w.dir]);
+    await git(p.path, ['worktree', 'prune']);
+    if (!w.pr) await git(p.path, ['branch', '-D', w.branch]); // a branch with a pull request stays
+  }
+  fs.rm(w.dir, { recursive: true, force: true }, () => {});
+  delete t.work;
+  delete t.baseTree;
+}
+
 // ---------------------------------------------------------------- agents
 
 const running = new Map(); // task id -> { child, stopped }
@@ -1136,6 +1340,13 @@ function finish(t, outcome, message) {
   t.finishedAt = Date.now();
   t.waitReason = null;
   if (message) addLog(t, outcome === 'ok' ? 'status' : 'error', message);
+  if (outcome !== 'stopped') {
+    const name = (findProject(t.projectId) || {}).name || 'a project';
+    notify(outcome !== 'ok' ? `${t.id} did not finish (${name}): ${t.title}`
+      : t.phase === 'plan' ? `${t.id} has a plan ready for your OK (${name}): ${t.title}`
+        : t.kind === 'scan' ? `${t.id}: suggestions are ready for ${name}`
+          : `${t.id} finished (${name}): ${t.title}`);
+  }
   infoCache.delete(t.projectId);
   changed();
   pump();
@@ -1172,10 +1383,16 @@ function startAgent(t) {
   // Before an editing run, remember how the files look, so the task can show
   // exactly what changed. A follow-up keeps the first starting point.
   let ready = Promise.resolve();
-  if (editing(t) && !(resume && t.baseTree)) {
-    t.changes = null;
-    ready = snapshotTree(p.path).then((tree) => { t.baseTree = tree; }).catch(() => { t.baseTree = null; });
+  if (t.copy && editing(t) && !(t.work && fs.existsSync(t.work.dir))) {
+    delete t.work;
+    delete t.baseTree;
+    ready = makeCopy(t, p).catch((e) => { st.copyError = e.message; });
   }
+  ready = ready.then(() => {
+    if (st.copyError || !editing(t) || (resume && t.baseTree)) return null;
+    t.changes = null;
+    return snapshotTree(workDir(t, p)).then((tree) => { t.baseTree = tree; }).catch(() => { t.baseTree = null; });
+  });
   // "Auto" first finds out what kind of task this is. A follow-up stays on
   // the model the first run was given.
   // (The queue normally has sized the task already; this is the safety net.)
@@ -1183,6 +1400,7 @@ function startAgent(t) {
   else if (!(resume && t.auto) && !sized(t)) ready = Promise.all([ready, chooseModel(t, p, bin)]);
   ready.then(() => {
     if (st.stopped) { st.done = true; return finish(t, 'stopped', 'Stopped by you.'); }
+    if (st.copyError) { st.done = true; return finish(t, 'failed', st.copyError); }
     launchAgent(t, p, st, bin, resume, followUp);
   });
 }
@@ -1227,7 +1445,7 @@ function launchAgent(t, p, st, bin, resume, followUp) {
 
   let child;
   try {
-    child = spawn(bin, args, { cwd: p.path, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    child = spawn(bin, args, { cwd: workDir(t, p), env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
   } catch (e) {
     st.done = true;
     return finish(t, 'failed', `Could not start the agent: ${e.message}`);
@@ -1250,7 +1468,7 @@ function launchAgent(t, p, st, bin, resume, followUp) {
       raw.write(line + '\n');
       let ev;
       try { ev = JSON.parse(line); } catch { continue; }
-      onEvent(t, st, ev, p.path);
+      onEvent(t, st, ev, workDir(t, p));
     }
   });
   child.stderr.setEncoding('utf8');
@@ -1262,7 +1480,7 @@ function launchAgent(t, p, st, bin, resume, followUp) {
     raw.end();
     const r = st.result;
     if (r) recordSpend(t, r);
-    if (editing(t) && !spawnError) await saveChanges(t, p.path).catch(() => {});
+    if (editing(t) && !spawnError) await saveChanges(t, workDir(t, p)).catch(() => {});
     if (st.stopped) return finish(t, 'stopped', 'Stopped by you.');
     if (spawnError) return finish(t, 'failed', `Could not start the agent: ${spawnError.message}`);
     // Cut off by a Claude plan limit: wait for the reset, then carry on.
@@ -1372,6 +1590,13 @@ function pump() {
   // How many agents fit depends on how full the limit is, so starting one
   // next to another takes a recent reading. The first may always go.
   const stale = usageMode() !== 'full' && Boolean(bin) && (!db.limits || now - db.limits.at > 3 * 60000);
+  // Project by project: put the projects in line, then go down the line.
+  const line = db.settings.queueOrder !== 'mixed' ? projectLine(queued) : null;
+  const free = line ? limitRoom().free : 0;
+  if (line) {
+    const place = (t) => (line.get(t.projectId) || { rank: Infinity }).rank;
+    queued.sort((a, b) => (place(a) === place(b) ? 0 : place(a) < place(b) ? -1 : 1) || rank(b) - rank(a) || a.queuedAt - b.queuedAt);
+  }
   for (const t of queued) {
     if (stillCut(t) && !t.force) {
       const c = t.limitCut;
@@ -1379,6 +1604,13 @@ function pump() {
       continue;
     }
     if (hold && !t.force) { setWait(t, hold); continue; }
+    // "Run after": wait until the task it follows has really finished.
+    const first = t.after && !t.force ? findTask(t.after) : null;
+    if (first && first.status !== 'done' && !(first.status === 'review' && first.outcome === 'ok' && first.phase !== 'plan')) {
+      setWait(t, first.status !== 'review' ? `Waiting for ${first.id} to finish first`
+        : first.phase === 'plan' ? `Waiting for ${first.id}: its plan needs your OK` : `Waiting: ${first.id} did not finish`);
+      continue;
+    }
     // Auto: find out what kind of task this is before deciding when it may start.
     const p = findProject(t.projectId);
     if (bin && p && wantedModel(t) === 'auto' && !sized(t)) {
@@ -1390,11 +1622,26 @@ function pump() {
       continue;
     }
     if (running.size >= db.settings.maxAgents) { setWait(t, 'Waiting for a free agent slot'); continue; }
-    const clash = t.mode === 'edit' && [...running.keys()].some((id) => {
+    if (running.size >= agentCap() && !t.force) {
+      setWait(t, usageMode() === 'saver' ? 'Waiting for room: Saver runs one agent at a time' : 'Waiting for room: Balanced runs two agents at a time');
+      continue;
+    }
+    const clash = t.mode === 'edit' && !t.copy && [...running.keys()].some((id) => {
       const other = findTask(id);
-      return other && other.projectId === t.projectId && editing(other);
+      return other && other.projectId === t.projectId && editing(other) && !other.copy;
     });
     if (clash) { setWait(t, 'Waiting: another agent is editing this project'); continue; }
+    // Project by project: a project further down the line starts next to
+    // the ones before it only when all of them fit in the free limit.
+    const row = line && !t.force ? line.get(t.projectId) : null;
+    if (row && row.upTo > free) {
+      const before = [...line.values()].find((r) => r.rank < row.rank && r.left > 0);
+      const other = before ? before.id : [...running.keys()].map((id) => (findTask(id) || {}).projectId).find((pid) => pid && pid !== t.projectId);
+      if (other) {
+        setWait(t, `Waiting for room: ${(findProject(other) || { name: 'another project' }).name} is finished first, both do not fit in your 5-hour limit together`);
+        continue;
+      }
+    }
     if (stale && running.size && !t.force) {
       if (!limitCheck && now - limitCheckedAt > 60000) refreshLimits();
       // (If the check cannot run right now, go by the reading there is.)
@@ -1402,6 +1649,8 @@ function pump() {
     }
     const room = t.force ? null : roomFor(t);
     if (room) { setWait(t, room); continue; }
+    if (row) row.left -= 1;
+    focusProject = t.projectId;
     startAgent(t);
   }
 }
@@ -1413,6 +1662,21 @@ function pick(value, allowed, what) {
   return value;
 }
 const text = (v, max) => String(v == null ? '' : v).slice(0, max);
+
+// Tags are short labels you give a project to group similar ones ("Android",
+// "Client work"). Takes a list or comma-separated text. A tag another project
+// already uses keeps that project's spelling, so "android" joins "Android".
+function cleanTags(v, others = []) {
+  const known = new Map(others.flatMap((p) => p.tags || []).map((x) => [x.toLowerCase(), x]));
+  const out = [];
+  for (const raw of Array.isArray(v) ? v : String(v || '').split(',')) {
+    const typed = text(String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim(), 24).trim();
+    const tag = known.get(typed.toLowerCase()) || typed;
+    if (tag && !out.some((x) => x.toLowerCase() === tag.toLowerCase())) out.push(tag);
+    if (out.length === 8) break;
+  }
+  return out;
+}
 const agentBusy = (t) => t.status === 'queued' || (t.status === 'running' && t.assignee && t.assignee.kind === 'agent');
 
 function newTask(f) {
@@ -1441,6 +1705,28 @@ function newTask(f) {
   };
 }
 
+// Moves a task that no agent is running to To do, Needs review or Done.
+function moveTask(t, to) {
+  if (to === 'todo') { t.assignee = null; t.outcome = null; delete t.force; }
+  if (to === 'done') {
+    t.doneAt = Date.now();
+    if (t.work && (t.work.applied || t.work.pr)) removeCopy(t, findProject(t.projectId)).then(changed).catch(() => {});
+  }
+  if (to === 'review') t.finishedAt = Date.now();
+  // Work done by hand in VS Code ends here: record what it changed.
+  if (t.ide) {
+    delete t.ide;
+    const proj = findProject(t.projectId);
+    if (to !== 'todo' && proj) saveChanges(t, workDir(t, proj)).then(changed).catch(() => {});
+    if (to === 'review') t.outcome = 'ok';
+  }
+  t.waitReason = null;
+  delete t.pendingFollowUp;
+  delete t.limitCut;
+  addLog(t, 'status', { todo: 'Moved back to To do', review: 'Moved to Needs review', done: 'Marked done' }[to]);
+  t.status = to;
+}
+
 function queueTask(t) {
   delete t.ide;
   delete t.limitCut;
@@ -1459,6 +1745,7 @@ const api = {
       projects,
       tasks: db.tasks.map(briefTask),
       usage: usage(),
+      forecast: forecast(),
       meta: { version: API_VERSION, claude: findClaude(), running: running.size, suggestRoot: path.dirname(__dirname), home: os.homedir(),
         system: { memGb: Math.round(os.totalmem() / 2 ** 30), cores: os.cpus().length } },
     };
@@ -1520,6 +1807,9 @@ const api = {
       budget: Math.max(0, Number(body.budget) || 0),
     };
     const t = newTask(fields);
+    if (body.copy) t.copy = true;
+    if (body.after && findTask(body.after)) t.after = body.after;
+    if (REPEATS[body.repeat]) t.repeat = body.repeat;
     addLog(t, 'status', body.by ? `Task added by ${text(body.by, 60)}` : 'Task added');
     db.tasks.push(t);
     if (body.run) queueTask(t);
@@ -1596,6 +1886,20 @@ const api = {
     if ('description' in body) t.description = text(body.description, 20000);
     if ('priority' in body) t.priority = pick(body.priority, PRIORITIES, 'priority');
     if ('budget' in body) t.budget = Math.max(0, Number(body.budget) || 0);
+    if ('repeat' in body) t.repeat = REPEATS[body.repeat] ? body.repeat : '';
+    if ('after' in body) {
+      const first = body.after ? findTask(body.after) : null;
+      // Not itself, and not a task that (directly or further on) waits for this one.
+      for (let x = first, n = 0; x && n < 100; x = x.after ? findTask(x.after) : null, n++) {
+        if (x === t) throw new HttpError(400, 'That would make the two tasks wait for each other.');
+      }
+      t.after = first ? first.id : '';
+    }
+    if ('copy' in body && Boolean(body.copy) !== Boolean(t.copy)) {
+      if (locked) throw new HttpError(409, 'Stop the agent before changing this.');
+      if (t.work) throw new HttpError(409, 'This task already has a separate copy. Remove the copy first.');
+      t.copy = Boolean(body.copy);
+    }
     for (const k of ['mode', 'model', 'projectId']) {
       if (!(k in body) || body[k] === t[k]) continue;
       if (locked) throw new HttpError(409, 'Stop the agent before changing this.');
@@ -1613,26 +1917,27 @@ const api = {
       if (t.status === 'running' && t.assignee && t.assignee.kind === 'agent') {
         throw new HttpError(409, 'Stop the agent first.');
       }
-      if (to === 'todo') { t.assignee = null; t.outcome = null; delete t.force; }
-      if (to === 'done') t.doneAt = Date.now();
-      if (to === 'review') t.finishedAt = Date.now();
-      // Work done by hand in VS Code ends here: record what it changed.
-      if (t.ide) {
-        delete t.ide;
-        const proj = findProject(t.projectId);
-        if (to !== 'todo' && proj) saveChanges(t, proj.path).then(changed).catch(() => {});
-        if (to === 'review') t.outcome = 'ok';
-      }
-      t.waitReason = null;
-      delete t.pendingFollowUp;
-      delete t.limitCut;
-      addLog(t, 'status', { todo: 'Moved back to To do', review: 'Moved to Needs review', done: 'Marked done' }[to]);
-      t.status = to;
+      moveTask(t, to);
     }
     t.updatedAt = Date.now();
     changed();
     pump();
     return briefTask(t);
+  },
+
+  // "Mark all done" on the Needs review column: only tasks that are still
+  // waiting for review when the request arrives are touched.
+  markDone(req, res, m, body) {
+    let done = 0;
+    for (const id of Array.isArray(body.ids) ? body.ids : []) {
+      const t = findTask(id);
+      if (!t || t.status !== 'review') continue;
+      moveTask(t, 'done');
+      t.updatedAt = Date.now();
+      done++;
+    }
+    changed();
+    return { done };
   },
 
   deleteTask(req, res, m) {
@@ -1642,6 +1947,7 @@ const api = {
     if (st) killAgent(st);
     db.tasks = db.tasks.filter((x) => x !== t);
     fs.rm(changesFile(t.id), { force: true }, () => {});
+    if (t.work) removeCopy(t, findProject(t.projectId)).catch(() => {});
     changed();
     return { ok: true };
   },
@@ -1730,7 +2036,7 @@ const api = {
         addLog(t, action === 'done' ? 'status' : 'error', action === 'done' ? 'Reported as finished. Waiting for your review.' : 'Reported as not finished.');
         infoCache.delete(t.projectId);
         const proj = findProject(t.projectId);
-        if ((t.mode === 'edit' || byHand) && proj) saveChanges(t, proj.path).then(changed).catch(() => {});
+        if ((t.mode === 'edit' || byHand) && proj) saveChanges(t, workDir(t, proj)).then(changed).catch(() => {});
       }
       changed();
     }
@@ -1752,12 +2058,33 @@ const api = {
     return { added, skipped };
   },
 
+  // Makes a new, empty project folder and links it, so a task can start a
+  // project from nothing.
+  async newProject(req, res, m, body) {
+    const name = text(body.name, 80).trim();
+    if (!name) throw new HttpError(400, 'Give the new project a name.');
+    if (!/^[\p{L}\p{N}][\p{L}\p{N} ._-]*$/u.test(name) || name.endsWith('.')) {
+      throw new HttpError(400, 'Use letters, numbers, spaces, dashes, dots and underscores for the name, and start with a letter or number.');
+    }
+    const parent = normalizeDir(body.parent || path.dirname(__dirname));
+    const dir = path.join(parent, name);
+    if (fs.existsSync(dir)) throw new HttpError(409, `"${name}" already exists in that folder. Use "Link project" to add it.`);
+    try { fs.mkdirSync(dir); } catch (e) { throw new HttpError(500, `Could not make the folder: ${e.message}`); }
+    // A git repository lets the board show what each task changed.
+    if (body.git !== false) await sh('git', ['-C', dir, 'init', '-q']);
+    const p = { id: `P${db.pseq++}`, name, path: fs.realpathSync(dir), status: 'active', notes: '', deadline: '', createdAt: Date.now() };
+    db.projects.push(p);
+    changed();
+    return p;
+  },
+
   patchProject(req, res, m, body) {
     const p = findProject(m[1]);
     if (!p) throw new HttpError(404, 'That project is no longer linked.');
     if ('name' in body) { const v = text(body.name, 80).trim(); if (v) p.name = v; }
     if ('notes' in body) p.notes = text(body.notes, 5000);
     if ('status' in body) p.status = pick(body.status, PROJECT_STATUSES, 'status');
+    if ('tags' in body) p.tags = cleanTags(body.tags, db.projects.filter((x) => x !== p));
     if ('deadline' in body) p.deadline = /^\d{4}-\d{2}-\d{2}$/.test(body.deadline) ? body.deadline : '';
     if ('path' in body) {
       const dir = normalizeDir(body.path);
@@ -1818,6 +2145,70 @@ const api = {
     return { root, found };
   },
 
+  // A finished task that worked in a separate copy: bring its changes into
+  // the project, open a pull request for them, or throw the copy away.
+  async copyAction(req, res, m, body) {
+    const t = findTask(m[1]);
+    if (!t) throw new HttpError(404, 'That task no longer exists.');
+    const p = findProject(t.projectId);
+    if (!t.work || !p) throw new HttpError(409, 'This task has no separate copy.');
+    if (agentBusy(t)) throw new HttpError(409, 'Stop the agent first.');
+    const w = t.work;
+    const line = (r) => (r.err.trim() || r.out.trim()).split('\n').slice(-2).join(' ');
+
+    if (body.do === 'remove') {
+      await removeCopy(t, p);
+      addLog(t, 'status', 'Separate copy removed');
+      changed();
+      return briefTask(t);
+    }
+
+    if (body.do === 'apply') {
+      const end = await snapshotTree(w.dir);
+      if (!t.baseTree || !end) throw new HttpError(500, 'Could not read the changes in the copy.');
+      const diff = await git(w.dir, ['diff', '--binary', t.baseTree, end]);
+      if (!diff.ok) throw new HttpError(500, `Could not read the changes: ${line(diff)}`);
+      if (!diff.out.trim()) throw new HttpError(409, 'The copy has no changes to apply.');
+      const file = path.join(os.tmpdir(), `dash-apply-${t.id}-${Date.now()}.patch`);
+      fs.writeFileSync(file, diff.out);
+      try {
+        const check = await git(p.path, ['apply', '--check', file]);
+        if (!check.ok) throw new HttpError(409, 'These changes do not fit the project as it is now: the same lines were changed there since the copy was made. Open a pull request instead, or ask the agent to redo it.');
+        const done = await git(p.path, ['apply', file]);
+        if (!done.ok) throw new HttpError(500, `Could not apply the changes: ${line(done)}`);
+      } finally { fs.rm(file, { force: true }, () => {}); }
+      w.applied = Date.now();
+      addLog(t, 'status', 'Changes applied to the project folder (not committed)');
+      infoCache.delete(p.id);
+      changed();
+      return briefTask(t);
+    }
+
+    if (body.do === 'pr') {
+      const title = text(body.title, 200).trim() || t.title;
+      const remote = await git(w.dir, ['remote', 'get-url', 'origin']);
+      if (!remote.ok) throw new HttpError(409, 'This project has no "origin" remote on GitHub, so there is nowhere to open a pull request.');
+      await git(w.dir, ['add', '-A']);
+      const staged = await git(w.dir, ['diff', '--cached', '--quiet']);
+      const ahead = await git(w.dir, ['rev-list', '--count', `${w.base}..HEAD`]);
+      if (staged.ok && !(Number(ahead.out) > 0)) throw new HttpError(409, 'The copy has no changes to put in a pull request.');
+      if (!staged.ok) {
+        // The dashboard commits here, as you, because you pressed the button.
+        const commit = await git(w.dir, ['commit', '-m', title]);
+        if (!commit.ok) throw new HttpError(500, `Could not commit: ${line(commit)}`);
+      }
+      const push = await git(w.dir, ['push', '-u', 'origin', w.branch], { timeout: 120000 });
+      if (!push.ok) throw new HttpError(500, `Could not push the branch: ${line(push)}`);
+      const pr = await sh('gh', ['pr', 'create', '--head', w.branch, '--title', title, '--body', text(body.body, 20000)], { cwd: w.dir, timeout: 60000 });
+      if (!pr.ok) throw new HttpError(500, `The branch is pushed, but the pull request was not opened: ${line(pr)}`);
+      w.pr = (pr.out.match(/https?:\/\/\S+/) || [''])[0] || 'opened';
+      addLog(t, 'status', `Pull request opened: ${w.pr}`);
+      changed();
+      return briefTask(t);
+    }
+    throw new HttpError(400, 'Unknown action.');
+  },
+
   // "Continue in VS Code" and "Start in VS Code" on a task.
   async openInVSCode(req, res, m, body) {
     const t = findTask(m[1]);
@@ -1830,10 +2221,10 @@ const api = {
 
     if (body.how === 'continue') {
       // The agent's own conversation, else the newest one linked to the task.
-      const saved = (id) => fs.existsSync(path.join(sessionDir(p.path), `${id}.jsonl`));
+      const saved = (id) => fs.existsSync(path.join(sessionDir(workDir(t, p)), `${id}.jsonl`));
       const sid = [t.sessionId, ...(t.conversations || []).slice().reverse()].find((id) => id && saved(id));
       if (!sid) throw new HttpError(409, 'This task has no conversation saved on this Mac any more. Use "Start in VS Code" instead.');
-      const up = await openClaudeInVSCode(p.path, { session: sid });
+      const up = await openClaudeInVSCode(workDir(t, p), { session: sid });
       if (!mine && !agentBusy(t)) {
         // While you work on it by hand, the dashboard must not run its own
         // agent on the same conversation. Showing it as yours sees to that.
@@ -1846,7 +2237,7 @@ const api = {
         t.waitReason = null;
         addLog(t, 'status', 'Continued by you in VS Code');
         // Remember how the files look now, so the task can show what changed.
-        if (!t.baseTree) snapshotTree(p.path).then((tree) => { t.baseTree = tree; save(); }).catch(() => {});
+        if (!t.baseTree) snapshotTree(workDir(t, p)).then((tree) => { t.baseTree = tree; save(); }).catch(() => {});
         changed();
       }
       return { ok: true, sure: up, message: up
@@ -1869,11 +2260,35 @@ const api = {
     return usage();
   },
 
+  // "Plan a run": queues every To do task of the chosen projects, to run
+  // one project after another in the order given.
+  runProjects(req, res, m, body) {
+    const ids = [...new Set(Array.isArray(body.projectIds) ? body.projectIds.map(String) : [])].filter(findProject);
+    if (!ids.length) throw new HttpError(400, 'Choose at least one project.');
+    db.runOrder = ids;
+    focusProject = null; // your order counts from here on
+    db.settings.queueOrder = 'project';
+    let queued = 0;
+    for (const t of db.tasks) {
+      if (t.status !== 'todo' || !ids.includes(t.projectId)) continue;
+      delete t.pendingFollowUp;
+      queueTask(t);
+      queued += 1;
+    }
+    changed();
+    pump();
+    return { queued };
+  },
+
   patchSettings(req, res, m, body) {
     if ('maxAgents' in body) db.settings.maxAgents = Math.min(16, Math.max(1, Math.round(Number(body.maxAgents)) || 1));
     if ('defaultModel' in body) db.settings.defaultModel = pick(body.defaultModel, MODELS, 'model');
     if ('autoMax' in body) db.settings.autoMax = pick(body.autoMax, TIER_KEYS, 'level');
     if ('usageMode' in body) db.settings.usageMode = pick(body.usageMode, USAGE_MODES, 'usage mode');
+    if ('queueOrder' in body) db.settings.queueOrder = pick(body.queueOrder, QUEUE_ORDERS, 'queue order');
+    if ('autoSaver' in body) db.settings.autoSaver = Math.min(100, Math.max(0, Math.round(Number(body.autoSaver) || 0)));
+    if ('notify' in body) db.settings.notify = Boolean(body.notify);
+    if ('ntfyTopic' in body) db.settings.ntfyTopic = text(body.ntfyTopic, 80).trim().replace(/[^A-Za-z0-9_-]/g, '');
     if ('claudePath' in body) db.settings.claudePath = text(body.claudePath, 500).trim();
     const money = (v) => Math.min(100000, Math.max(0, Math.round((Number(v) || 0) * 100) / 100));
     if ('taskBudget' in body) db.settings.taskBudget = money(body.taskBudget);
@@ -1895,16 +2310,20 @@ const routes = [
   ['POST', /^\/api\/tasks\/(T\d+)\/(run|stop|claim|note|done|fail|link|unlink)$/, api.taskAction],
   ['POST', /^\/api\/tasks\/(T\d+)\/adopt$/, api.adopt],
   ['POST', /^\/api\/tasks\/(T\d+)\/vscode$/, api.openInVSCode],
+  ['POST', /^\/api\/tasks\/(T\d+)\/copy$/, api.copyAction],
   ['POST', /^\/api\/suggest$/, api.suggest],
   ['POST', /^\/api\/limits\/check$/, api.checkLimits],
   ['GET', /^\/api\/projects\/(P\d+)\/conversations$/, api.listConversations],
   ['GET', /^\/api\/conversations\/([0-9a-f-]{36})$/, api.getConversation],
   ['POST', /^\/api\/projects$/, api.linkProjects],
+  ['POST', /^\/api\/projects\/new$/, api.newProject],
+  ['POST', /^\/api\/tasks\/mark-done$/, api.markDone],
   ['PATCH', /^\/api\/projects\/(P\d+)$/, api.patchProject],
   ['DELETE', /^\/api\/projects\/(P\d+)$/, api.deleteProject],
   ['POST', /^\/api\/projects\/(P\d+)\/open$/, api.openProject],
   ['POST', /^\/api\/pick-folder$/, api.pickFolder],
   ['POST', /^\/api\/scan$/, api.scan],
+  ['POST', /^\/api\/run-projects$/, api.runProjects],
   ['PATCH', /^\/api\/settings$/, api.patchSettings],
 ];
 
@@ -1993,6 +2412,34 @@ const server = http.createServer(async (req, res) => {
 setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 25000).unref();
 // Paused tasks start by themselves once a limit resets or a new day begins.
 setInterval(pump, 60000).unref();
+
+// A repeating task runs again a day or a week after it last finished: a scan
+// simply looks again, any other task gets a fresh copy of itself.
+function runRepeats() {
+  const now = Date.now();
+  let any = false;
+  for (const t of [...db.tasks]) {
+    const every = REPEATS[t.repeat];
+    const last = t.finishedAt || t.doneAt;
+    if (!every || !last || (t.status !== 'review' && t.status !== 'done') || now < last + every) continue;
+    any = true;
+    if (t.kind === 'scan') {
+      addLog(t, 'status', 'Looking again (repeats)');
+      queueTask(t);
+      continue;
+    }
+    const n = newTask({ projectId: t.projectId, title: t.title, description: t.description, mode: t.mode, model: t.model, priority: t.priority, budget: t.budget });
+    n.repeat = t.repeat;
+    n.copy = t.copy;
+    addLog(n, 'status', `Repeat of ${t.id}`);
+    db.tasks.push(n);
+    queueTask(n);
+    t.repeat = '';
+    addLog(t, 'status', `Repeated as ${n.id}`);
+  }
+  if (any) { changed(); pump(); }
+}
+setInterval(runRepeats, 60000).unref();
 
 function shutdown() {
   for (const st of running.values()) killAgent(st);

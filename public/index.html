@@ -5,13 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Project Dashboard</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%232f5bd7'/%3E%3Crect x='3' y='3' width='3' height='10' rx='1' fill='white'/%3E%3Crect x='7' y='3' width='3' height='6' rx='1' fill='white'/%3E%3Crect x='11' y='3' width='2' height='8' rx='1' fill='white'/%3E%3C/svg%3E">
+<script>
+  // Apply a chosen theme before the page draws, so it does not flash.
+  try { var t = localStorage.getItem('dash.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="top">
   <div class="brand">
-    <h1>Project Dashboard</h1>
-    <p id="stats" class="muted"></p>
+    <svg class="logo" viewBox="0 0 16 16" width="30" height="30" aria-hidden="true"><rect width="16" height="16" rx="4" fill="var(--accent)"/><rect x="3" y="3" width="3" height="10" rx="1" fill="var(--accent-ink)"/><rect x="7" y="3" width="3" height="6" rx="1" fill="var(--accent-ink)"/><rect x="11" y="3" width="2" height="8" rx="1" fill="var(--accent-ink)"/></svg>
+    <div>
+      <h1>Project Dashboard</h1>
+      <p id="stats" class="muted"></p>
+    </div>
   </div>
   <div class="top-actions">
     <button id="usage" class="usage" title="Usage and budgets"></button>
@@ -21,8 +28,11 @@
       <option value="balanced">Usage: Balanced</option>
       <option value="full">Usage: Full power</option>
     </select>
+    <span class="top-gap"></span>
+    <button id="btn-theme" class="btn ghost icon" title="Switch theme" aria-label="Switch theme"></button>
     <button id="btn-settings" class="btn ghost">Settings</button>
     <button id="btn-link" class="btn">Link project</button>
+    <button id="btn-plan" class="btn" hidden title="See how much of your Claude limit each project's tasks will take, and run them one project after another">Plan a run</button>
     <button id="btn-suggest" class="btn" hidden title="Let Claude look at your projects and suggest what to do next">AI suggestions</button>
     <button id="btn-new" class="btn primary">New task</button>
   </div>
@@ -37,6 +47,7 @@
       <button id="btn-refresh" class="link" title="Re-read git status for every project">Refresh</button>
     </div>
     <label class="side-sort"><span>Sort</span><select id="proj-sort" aria-label="Sort projects"></select></label>
+    <div id="proj-tags" class="side-tags" aria-label="Show only projects with a tag" hidden></div>
     <p id="proj-tip" class="side-tip muted" hidden>Drag projects to arrange them (or Alt+Up / Alt+Down).</p>
     <nav id="projects"></nav>
   </aside>

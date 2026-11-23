@@ -6,13 +6,16 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
 const ROOT = path.join(__dirname, '..');
-const PORT = 45000 + Math.floor(Math.random() * 5000);
-const HOST = `127.0.0.1:${PORT}`;
+// Set in before(): a port the system says is free. A random guess can land in
+// a range Windows reserves for itself, where listening is refused (EACCES).
+let PORT;
+let HOST;
 const WIN = process.platform === 'win32';
 const FAKE = path.join(__dirname, 'fake-claude.js');
 let tmp;
@@ -41,7 +44,20 @@ function request(method, pathname, { body, headers = {} } = {}) {
   });
 }
 
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
 before(async () => {
+  PORT = await freePort();
+  HOST = `127.0.0.1:${PORT}`;
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pacer-test-'));
   fs.mkdirSync(path.join(tmp, 'WeatherApp'));
   pidFile = path.join(tmp, 'pids.txt');

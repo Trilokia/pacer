@@ -27,7 +27,7 @@ An **Edit files** task starts an agent that changes files in your project withou
 ## Install
 
 ```
-git clone <this repository's URL> pacer
+git clone https://github.com/Trilokia/pacer.git
 cd pacer
 node server.js
 ```

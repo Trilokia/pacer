@@ -1,5 +1,11 @@
 # Pacer
 
+[![Tests](https://github.com/Trilokia/pacer/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Trilokia/pacer/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node.js 20+](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Platforms: macOS, Windows, Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#requirements)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](package.json)
+
 A task board for all your projects that runs on your own computer (macOS, Windows or Linux). You link project folders, add tasks, and either let Pacer start Claude Code agents on them or let your own Claude sessions in VS Code pick them up. It paces the agents against your Claude plan limits, so a long queue finishes whole projects instead of leaving every project half done when the limit runs out. Progress and final reports show up on the board. Flowcharts in [How Pacer decides](#how-pacer-decides) show when tasks start, which model they use and what happens when a run ends.
 
 Pacer is a small web app: a Node server on your computer, and a page you open in your browser. It needs only Node (no `npm install`). It listens on your computer only and is not reachable from the network. It runs on your computer rather than as a website because it starts `claude` in your project folders.
